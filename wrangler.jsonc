@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ai-bookmark-manager",
+  "main": "worker/src/index.ts",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": "./web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "bookmarks",
+      "database_id": "ca1aec41-c09e-437c-9b4d-d1af0ba7523b"
+    }
+  ],
+
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "bookmarks-index"
+    }
+  ],
+
+  "ai": {
+    "binding": "AI"
+  },
+
+  "observability": {
+    "enabled": true
+  },
+
+  // 03:00 UTC = 09:00 Dhaka — daily picks ready before morning triage.
+  // Change this if you want a different wake-up ritual.
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  },
+
+  "vars": {
+    "ENV": "development"
+  }
+}
