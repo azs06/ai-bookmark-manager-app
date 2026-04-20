@@ -204,8 +204,14 @@ function AddForm({ onSaved }: { onSaved: () => Promise<void> }) {
         body: JSON.stringify({ url: trimmed }),
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = (await r.json()) as { duplicate?: boolean };
-      setMsg(data.duplicate ? 'Already saved.' : 'Saved — enriching in background…');
+      const data = (await r.json()) as { duplicate?: boolean; restored?: boolean };
+      setMsg(
+        data.duplicate
+          ? 'Already saved.'
+          : data.restored
+            ? 'Restored — refreshing in background…'
+            : 'Saved — enriching in background…',
+      );
       setUrl('');
       await onSaved();
       // Enrichment completes ~2-3s after save. Pick up the summary/tags then.

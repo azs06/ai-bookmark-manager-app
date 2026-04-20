@@ -51,30 +51,54 @@ app.post('/', async (c) => {
 // feature still works in a cold-start state.
 async function gatherContext(env: Env, question: string): Promise<ContextRow[]> {
   const ids = await semanticIds(env, question);
+  const semanticRows = ids.length ? await loadRowsByIds(env, ids) : [];
 
-  const query = ids.length
-    ? env.DB.prepare(`
+  if (semanticRows.length >= TOP_K) {
+    return semanticRows;
+  }
+
+  const fallbackRows = await loadFallbackRows(
+    env,
+    semanticRows.map((row) => row.id),
+    TOP_K - semanticRows.length,
+  );
+
+  return [...semanticRows, ...fallbackRows];
+}
+
+async function loadRowsByIds(env: Env, ids: number[]): Promise<ContextRow[]> {
+  const rows = await env.DB.prepare(`
+      SELECT id, url, title, ai_summary, ai_tags, importance, created_at
+      FROM bookmarks
+      WHERE id IN (${ids.map(() => '?').join(',')}) AND status != 'archived'
+    `).bind(...ids)
+    .all<ContextRow>();
+
+  const results = rows.results ?? [];
+  const order = new Map(ids.map((id, i) => [id, i]));
+  results.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+  return results;
+}
+
+async function loadFallbackRows(env: Env, excludeIds: number[], limit: number): Promise<ContextRow[]> {
+  if (limit <= 0) return [];
+
+  const exclusionClause = excludeIds.length
+    ? `AND id NOT IN (${excludeIds.map(() => '?').join(',')})`
+    : '';
+
+  const query = env.DB.prepare(`
         SELECT id, url, title, ai_summary, ai_tags, importance, created_at
         FROM bookmarks
-        WHERE id IN (${ids.map(() => '?').join(',')}) AND status != 'archived'
-      `).bind(...ids)
-    : env.DB.prepare(`
-        SELECT id, url, title, ai_summary, ai_tags, importance, created_at
-        FROM bookmarks
-        WHERE status IN ('active', 'partial')
+        WHERE status IN ('active', 'partial', 'imported')
+        ${exclusionClause}
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
-      `).bind(TOP_K);
+      `)
+    .bind(...excludeIds, limit);
 
   const rows = await query.all<ContextRow>();
-  const results = rows.results ?? [];
-
-  // Re-order D1 results to match the semantic ranking (IN (...) doesn't preserve order).
-  if (ids.length) {
-    const order = new Map(ids.map((id, i) => [id, i]));
-    results.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
-  }
-  return results;
+  return rows.results ?? [];
 }
 
 async function semanticIds(env: Env, question: string): Promise<number[]> {

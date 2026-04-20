@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS bookmarks (
   view_count      INTEGER NOT NULL DEFAULT 0,
   last_viewed_at  INTEGER,
   content_excerpt TEXT,
-  status          TEXT    NOT NULL DEFAULT 'pending', -- pending, active, partial, failed, archived
+  status          TEXT    NOT NULL DEFAULT 'pending', -- pending, active, partial, failed, imported, archived
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL
 );

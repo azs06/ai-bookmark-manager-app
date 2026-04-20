@@ -6,10 +6,17 @@ export interface Env {
   AI?: Ai;
   ASSETS: Fetcher;
   ENV: string;
+  ALLOWED_ORIGINS?: string;
   ANTHROPIC_API_KEY?: string;
 }
 
-export type BookmarkStatus = 'pending' | 'active' | 'partial' | 'failed' | 'archived';
+export type BookmarkStatus =
+  | 'pending'
+  | 'active'
+  | 'partial'
+  | 'failed'
+  | 'imported'
+  | 'archived';
 
 export interface BookmarkRow {
   id: number;

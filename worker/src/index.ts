@@ -5,14 +5,16 @@ import search from './routes/search';
 import suggestions from './routes/suggestions';
 import chat from './routes/chat';
 import { runDailySuggestions } from './lib/suggestions';
+import { resolveAllowedOrigin } from './lib/cors';
 import type { Env } from './types';
 
 const app = new Hono<{ Bindings: Env }>();
 
 // Extension and PWA both hit /api/*. CORS is permissive here because
-// Cloudflare Access enforces identity at the edge before requests reach us.
+// Cloudflare Access enforces identity, but we still keep read access scoped to
+// first-party web origins plus Chrome extension pages.
 app.use('/api/*', cors({
-  origin: (origin) => origin ?? '*',
+  origin: (origin, c) => resolveAllowedOrigin(origin, c),
   credentials: true,
   allowHeaders: ['Content-Type'],
 }));

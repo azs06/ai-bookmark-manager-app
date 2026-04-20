@@ -1,9 +1,20 @@
 import { Hono } from 'hono';
-import type { Env } from '../types';
+import type { BookmarkStatus, Env } from '../types';
 import { hashUrl, normalizeUrl } from '../lib/url';
 import { enrich } from '../lib/enrich';
+import { deleteEmbedding, embedAndUpsert } from '../lib/vector';
 
 const app = new Hono<{ Bindings: Env }>();
+
+interface ExistingBookmark {
+  id: number;
+  status: BookmarkStatus;
+  title: string | null;
+  note: string;
+  ai_summary: string | null;
+  ai_tags: string;
+  content_excerpt: string | null;
+}
 
 app.post('/', async (c) => {
   const body = await c.req.json<{ url?: string; title?: string; note?: string }>();
@@ -15,11 +26,43 @@ app.post('/', async (c) => {
   const now = Date.now();
 
   const existing = await c.env.DB
-    .prepare('SELECT id, status FROM bookmarks WHERE url_hash = ?')
+    .prepare(`
+      SELECT id, status, title, note, ai_summary, ai_tags, content_excerpt
+      FROM bookmarks
+      WHERE url_hash = ?
+    `)
     .bind(urlHash)
-    .first<{ id: number; status: string }>();
+    .first<ExistingBookmark>();
 
   if (existing) {
+    if (existing.status === 'archived') {
+      const restoredStatus = deriveRestoredStatus(existing);
+      const restoredTitle = body.title ?? existing.title;
+      const restoredNote = body.note ?? existing.note;
+
+      await c.env.DB
+        .prepare(`
+          UPDATE bookmarks
+          SET title = ?, note = ?, status = ?, updated_at = ?
+          WHERE id = ?
+        `)
+        .bind(restoredTitle, restoredNote, restoredStatus, now, existing.id)
+        .run();
+
+      c.executionCtx.waitUntil(
+        repairRestoredBookmark(c.env, {
+          ...existing,
+          title: restoredTitle,
+          note: restoredNote,
+          status: restoredStatus,
+        }).catch((err) => {
+          console.error('restore repair failed', err);
+        }),
+      );
+
+      return c.json({ id: existing.id, duplicate: false, restored: true, status: restoredStatus });
+    }
+
     await c.env.DB
       .prepare('UPDATE bookmarks SET updated_at = ? WHERE id = ?')
       .bind(now, existing.id)
@@ -153,7 +196,42 @@ app.delete('/:id', async (c) => {
     .bind(Date.now(), id)
     .run();
 
+  c.executionCtx.waitUntil(
+    deleteEmbedding(c.env, id).catch((err) => {
+      console.error('vector delete failed', err);
+    }),
+  );
+
   return c.json({ ok: true });
 });
+
+function deriveRestoredStatus(row: Pick<ExistingBookmark, 'ai_summary' | 'ai_tags' | 'content_excerpt'>): BookmarkStatus {
+  if (row.ai_summary) return 'active';
+  if (row.content_excerpt) return 'partial';
+  if (hasStoredTags(row.ai_tags)) return 'imported';
+  return 'pending';
+}
+
+function hasStoredTags(raw: string): boolean {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.some((item) => typeof item === 'string' && item.trim());
+  } catch {
+    return false;
+  }
+}
+
+async function repairRestoredBookmark(env: Env, row: ExistingBookmark): Promise<void> {
+  if (row.ai_summary) {
+    await embedAndUpsert(env, row.id, {
+      title: row.title,
+      summary: row.ai_summary,
+      excerpt: row.content_excerpt,
+    });
+    return;
+  }
+
+  await enrich(env, row.id);
+}
 
 export default app;

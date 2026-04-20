@@ -32,6 +32,11 @@ export async function embedAndUpsert(
   ]);
 }
 
+export async function deleteEmbedding(env: Env, bookmarkId: number): Promise<void> {
+  if (!env.VECTORIZE) return;
+  await env.VECTORIZE.deleteByIds([String(bookmarkId)]);
+}
+
 export async function embedQuery(env: Env, query: string): Promise<number[] | null> {
   if (!env.AI) return null;
   return embed(env, query);
