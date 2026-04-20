@@ -2,7 +2,7 @@ import type { Env } from '../types';
 import { summarizeAndTag } from './haiku';
 import { embedAndUpsert } from './vector';
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; AIBookmarks/0.1; +https://bookmarks.soikat.dev)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; AIBookmarks/0.1)';
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_EXCERPT_CHARS = 3000;
 

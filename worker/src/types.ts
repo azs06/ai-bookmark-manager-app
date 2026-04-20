@@ -7,6 +7,7 @@ export interface Env {
   ASSETS: Fetcher;
   ENV: string;
   ALLOWED_ORIGINS?: string;
+  ALLOWED_EXTENSION_ORIGINS?: string;
   ANTHROPIC_API_KEY?: string;
 }
 

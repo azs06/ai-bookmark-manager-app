@@ -14,8 +14,7 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "bookmarks",
-      "database_id": "ca1aec41-c09e-437c-9b4d-d1af0ba7523b"
+      "database_name": "bookmarks"
     }
   ],
 

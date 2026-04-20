@@ -17,12 +17,13 @@ export function resolveAllowedOrigin(origin: string, c: Context<{ Bindings: Env 
     return origin;
   }
 
-  if (origin.startsWith('chrome-extension://')) {
+  const configured = parseConfiguredOrigins(c.env.ALLOWED_ORIGINS);
+  if (!origin.startsWith('chrome-extension://') && configured.has(origin)) {
     return origin;
   }
 
-  const configured = parseConfiguredOrigins(c.env.ALLOWED_ORIGINS);
-  if (configured.has(origin)) {
+  const configuredExtensions = parseConfiguredOrigins(c.env.ALLOWED_EXTENSION_ORIGINS);
+  if (origin.startsWith('chrome-extension://') && configuredExtensions.has(origin)) {
     return origin;
   }
 
