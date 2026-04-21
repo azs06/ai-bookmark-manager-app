@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "workspaces": ["web"],
   "scripts": {
     "build": "npm run build:web",
     "cf-typegen": "wrangler types",
