@@ -1,11 +1,4 @@
-export interface Env {
-  DB: D1Database;
-  VECTORIZE?: VectorizeIndex;
-  KV?: KVNamespace;
-  R2?: R2Bucket;
-  AI?: Ai;
-  ASSETS: Fetcher;
-  ENV: string;
+export interface Env extends Cloudflare.Env {
   ALLOWED_ORIGINS?: string;
   ALLOWED_EXTENSION_ORIGINS?: string;
   ANTHROPIC_API_KEY?: string;

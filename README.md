@@ -58,6 +58,8 @@ This app expects these bindings:
 
 The committed `wrangler.jsonc` is intentionally safe for a public repo. Configure your real resources in Cloudflare for your deployment.
 
+This repo expects `wrangler` 4.45 or newer so D1 bindings can be declared without committing a `database_id`.
+
 ## Local development
 
 Install dependencies:
@@ -84,6 +86,12 @@ npm run dev:web
 ```
 
 The Vite dev server proxies `/api` to the local Worker on `http://localhost:8787`.
+
+If you change `wrangler.jsonc`, regenerate the Worker runtime types with:
+
+```bash
+npm run cf-typegen
+```
 
 ## Deploy
 
