@@ -41,5 +41,31 @@
 
   "vars": {
     "ENV": "development"
+  },
+
+  "env": {
+    "production": {
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "bookmarks"
+        }
+      ],
+
+      "vectorize": [
+        {
+          "binding": "VECTORIZE",
+          "index_name": "bookmarks-index"
+        }
+      ],
+
+      "ai": {
+        "binding": "AI"
+      },
+
+      "vars": {
+        "ENV": "production"
+      }
+    }
   }
 }
