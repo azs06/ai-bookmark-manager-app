@@ -23,6 +23,7 @@ export interface BookmarkRow {
   domain: string | null;
   ai_summary: string | null;
   ai_tags: string;
+  category_id: number | null;
   importance: 0 | 1 | 2;
   view_count: number;
   last_viewed_at: number | null;

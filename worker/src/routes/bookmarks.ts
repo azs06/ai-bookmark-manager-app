@@ -89,23 +89,52 @@ app.get('/', async (c) => {
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '50'), 1), 100);
   const offset = Math.max(Number(c.req.query('offset') ?? '0'), 0);
 
+  // Scope:
+  //   (missing | __all__)       → every non-archived bookmark
+  //   __uncategorized__         → bookmarks with NULL category_id
+  //   <numeric id>              → that category AND all its descendants (recursive CTE)
+  const scope = c.req.query('scope');
+  const categoryId = scope && scope !== '__all__' && scope !== '__uncategorized__'
+    ? Number(scope)
+    : null;
+
+  let where = `b.status != 'archived'`;
+  let from = `FROM bookmarks b`;
+  const params: unknown[] = [];
+
+  if (scope === '__uncategorized__') {
+    where += ` AND b.category_id IS NULL`;
+  } else if (categoryId !== null && Number.isFinite(categoryId)) {
+    // CTE collects the subtree, then inner-join filters bookmarks to it.
+    from = `
+      FROM bookmarks b
+      INNER JOIN (
+        WITH RECURSIVE subtree(id) AS (
+          SELECT ? UNION ALL
+          SELECT c.id FROM categories c INNER JOIN subtree s ON c.parent_id = s.id
+        )
+        SELECT id FROM subtree
+      ) sc ON sc.id = b.category_id
+    `;
+    params.push(categoryId);
+  }
+
   const totalRow = await c.env.DB
-    .prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE status != 'archived'`)
+    .prepare(`SELECT COUNT(*) AS n ${from} WHERE ${where}`)
+    .bind(...params)
     .first<{ n: number }>();
   const total = totalRow?.n ?? 0;
 
-  // id DESC as final tiebreaker — imported rows share importance+created_at,
-  // so without it pagination would shuffle rows between pages.
   const rows = await c.env.DB
     .prepare(`
-      SELECT id, url, title, note, og_image_url, domain, ai_summary, ai_tags,
-             importance, status, created_at
-      FROM bookmarks
-      WHERE status != 'archived'
-      ORDER BY importance DESC, created_at DESC, id DESC
+      SELECT b.id, b.url, b.title, b.note, b.og_image_url, b.domain,
+             b.ai_summary, b.ai_tags, b.category_id, b.importance, b.status, b.created_at
+      ${from}
+      WHERE ${where}
+      ORDER BY b.importance DESC, b.created_at DESC, b.id DESC
       LIMIT ? OFFSET ?
     `)
-    .bind(limit, offset)
+    .bind(...params, limit, offset)
     .all();
 
   return c.json({ bookmarks: rows.results, total, offset, limit });
@@ -115,7 +144,7 @@ app.patch('/:id', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
 
-  const body = await c.req.json<{ importance?: 0 | 1 | 2; note?: string }>();
+  const body = await c.req.json<{ importance?: 0 | 1 | 2; note?: string; category_id?: number | null }>();
   const updates: string[] = [];
   const values: unknown[] = [];
 
@@ -129,6 +158,21 @@ app.patch('/:id', async (c) => {
   if (body.note !== undefined) {
     updates.push('note = ?');
     values.push(body.note);
+  }
+  if (body.category_id !== undefined) {
+    const next = body.category_id === null ? null : Number(body.category_id);
+    if (next !== null && (!Number.isFinite(next) || next <= 0)) {
+      return c.json({ error: 'invalid category_id' }, 400);
+    }
+    if (next !== null) {
+      const exists = await c.env.DB
+        .prepare(`SELECT id FROM categories WHERE id = ?`)
+        .bind(next)
+        .first<{ id: number }>();
+      if (!exists) return c.json({ error: 'category not found' }, 400);
+    }
+    updates.push('category_id = ?');
+    values.push(next);
   }
   if (!updates.length) return c.json({ error: 'nothing to update' }, 400);
 
