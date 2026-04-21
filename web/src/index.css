@@ -286,6 +286,33 @@ section h2 {
   font-style: italic;
 }
 
+.count-hint {
+  color: var(--muted);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 12px;
+  margin-left: 4px;
+}
+
+.load-more-wrap {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+.load-more {
+  padding: 8px 18px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.load-more:hover:not(:disabled) { border-color: var(--accent); }
+.load-more:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* ─── Today's picks ──────────────────────────────────────────────── */
 
 .picks-section h2 {

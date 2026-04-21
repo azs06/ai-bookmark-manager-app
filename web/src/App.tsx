@@ -17,8 +17,12 @@ interface Bookmark {
 type View = 'list' | 'grid';
 type Patch = Partial<Pick<Bookmark, 'importance' | 'note'>>;
 
+const PAGE_SIZE = 50;
+
 export default function App() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [view, setView] = useState<View>('list');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -28,10 +32,11 @@ export default function App() {
 
   const load = useCallback(async () => {
     try {
-      const r = await fetch('/api/bookmarks');
+      const r = await fetch(`/api/bookmarks?limit=${PAGE_SIZE}&offset=0`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = (await r.json()) as { bookmarks: Bookmark[] };
+      const d = (await r.json()) as { bookmarks: Bookmark[]; total: number };
       setBookmarks(d.bookmarks ?? []);
+      setTotal(d.total ?? 0);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -39,6 +44,27 @@ export default function App() {
       setLoading(false);
     }
   }, []);
+
+  const loadMore = useCallback(async () => {
+    if (loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const r = await fetch(`/api/bookmarks?limit=${PAGE_SIZE}&offset=${bookmarks.length}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = (await r.json()) as { bookmarks: Bookmark[]; total: number };
+      // Defensive de-dup: if a bookmark was added/removed between pages, the
+      // offset could slide and repeat a row. Filter by id to be safe.
+      setBookmarks((prev) => {
+        const seen = new Set(prev.map((b) => b.id));
+        return [...prev, ...(d.bookmarks ?? []).filter((b) => !seen.has(b.id))];
+      });
+      setTotal(d.total ?? 0);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [bookmarks.length, loadingMore]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -170,7 +196,7 @@ export default function App() {
 
           {!loading && !error && (
             <section>
-              <h2>Recent</h2>
+              <h2>Recent <span className="count-hint">— {bookmarks.length} of {total}</span></h2>
               <BookmarkList
                 items={rest}
                 view={view}
@@ -178,6 +204,18 @@ export default function App() {
                 onUpdate={updateBookmark}
                 onDelete={removeBookmark}
               />
+              {bookmarks.length < total && (
+                <div className="load-more-wrap">
+                  <button
+                    type="button"
+                    className="load-more"
+                    onClick={() => { void loadMore(); }}
+                    disabled={loadingMore}
+                  >
+                    {loadingMore ? 'Loading…' : `Load more (${total - bookmarks.length} left)`}
+                  </button>
+                </div>
+              )}
             </section>
           )}
         </>

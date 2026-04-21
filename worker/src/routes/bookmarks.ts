@@ -86,20 +86,29 @@ app.post('/', async (c) => {
 });
 
 app.get('/', async (c) => {
-  const limit = Math.min(Number(c.req.query('limit') ?? '50'), 200);
+  const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '50'), 1), 100);
+  const offset = Math.max(Number(c.req.query('offset') ?? '0'), 0);
+
+  const totalRow = await c.env.DB
+    .prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE status != 'archived'`)
+    .first<{ n: number }>();
+  const total = totalRow?.n ?? 0;
+
+  // id DESC as final tiebreaker — imported rows share importance+created_at,
+  // so without it pagination would shuffle rows between pages.
   const rows = await c.env.DB
     .prepare(`
       SELECT id, url, title, note, og_image_url, domain, ai_summary, ai_tags,
              importance, status, created_at
       FROM bookmarks
       WHERE status != 'archived'
-      ORDER BY importance DESC, created_at DESC
-      LIMIT ?
+      ORDER BY importance DESC, created_at DESC, id DESC
+      LIMIT ? OFFSET ?
     `)
-    .bind(limit)
+    .bind(limit, offset)
     .all();
 
-  return c.json({ bookmarks: rows.results });
+  return c.json({ bookmarks: rows.results, total, offset, limit });
 });
 
 app.patch('/:id', async (c) => {
