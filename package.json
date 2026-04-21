@@ -4,11 +4,14 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "build": "npm run build:web",
     "cf-typegen": "wrangler types",
     "dev": "wrangler dev",
     "dev:web": "cd web && npm run dev",
     "build:web": "cd web && npm run build",
     "deploy": "npm run build:web && wrangler deploy",
+    "deploy:prod": "wrangler deploy --env production",
+    "versions:upload:prod": "wrangler versions upload --env production",
     "db:init:local": "wrangler d1 execute bookmarks --local --file=./schema.sql",
     "db:init:remote": "wrangler d1 execute bookmarks --remote --file=./schema.sql",
     "typecheck": "tsc --noEmit"

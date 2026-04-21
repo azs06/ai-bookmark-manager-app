@@ -107,6 +107,18 @@ Before deploying, make sure your Cloudflare project has:
 - `ANTHROPIC_API_KEY` set as a secret
 - `ALLOWED_ORIGINS` and `ALLOWED_EXTENSION_ORIGINS` set for your actual clients
 
+### Cloudflare Builds
+
+If you deploy from GitHub using Workers Builds, configure the project with:
+
+```bash
+Build command: npm run build
+Deploy command: npm run deploy:prod
+Non-production branch deploy command: npm run versions:upload:prod
+```
+
+The preview deploy command must target `--env production`, otherwise Wrangler will use the top-level config and warn about multiple environments. The separate build command is required because `wrangler versions upload` does not build `web/dist` for you.
+
 ## Companion extension
 
 The companion browser extension is a separate repo. It is not standalone and expects this app to expose:
