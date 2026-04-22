@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import bookmarks from './routes/bookmarks';
+import categories from './routes/categories';
 import search from './routes/search';
 import suggestions from './routes/suggestions';
 import chat from './routes/chat';
@@ -26,6 +27,7 @@ app.get('/api/health', (c) => c.json({
 }));
 
 app.route('/api/bookmarks', bookmarks);
+app.route('/api/categories', categories);
 app.route('/api/search', search);
 app.route('/api/suggestions', suggestions);
 app.route('/api/chat', chat);

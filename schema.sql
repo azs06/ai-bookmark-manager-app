@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS bookmarks (
   domain          TEXT,
   ai_summary      TEXT,
   ai_tags         TEXT    NOT NULL DEFAULT '[]',
+  category_id     INTEGER REFERENCES categories(id) ON DELETE SET NULL,
   importance      INTEGER NOT NULL DEFAULT 0,   -- 0 normal, 1 important, 2 pinned
   view_count      INTEGER NOT NULL DEFAULT 0,
   last_viewed_at  INTEGER,
@@ -26,6 +27,25 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at  ON bookmarks(created_at DES
 CREATE INDEX IF NOT EXISTS idx_bookmarks_importance  ON bookmarks(importance DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_bookmarks_status      ON bookmarks(status);
 CREATE INDEX IF NOT EXISTS idx_bookmarks_domain      ON bookmarks(domain);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_category_id ON bookmarks(category_id);
+
+-- Raindrop-style hierarchical collections. parent_id = NULL → top-level.
+-- ON DELETE of a category: bookmarks go to "Uncategorized" (ON DELETE SET NULL
+-- on bookmarks.category_id). Child categories are re-parented in application
+-- code (DELETE /api/categories/:id) so the tree survives rather than cascades.
+CREATE TABLE IF NOT EXISTS categories (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT    NOT NULL,
+  parent_id   INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id);
+
+-- Sibling names must be unique. SQLite's UNIQUE treats NULLs as distinct, so
+-- COALESCE(parent_id, 0) collapses top-level siblings into a single bucket.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_categories_sibling
+  ON categories(COALESCE(parent_id, 0), name COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS import_jobs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,

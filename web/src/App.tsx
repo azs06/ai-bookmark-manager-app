@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 
 interface Bookmark {
   id: number;
@@ -8,21 +8,116 @@ interface Bookmark {
   domain: string | null;
   ai_summary: string | null;
   ai_tags: string;
+  category_id: number | null;
   og_image_url: string | null;
   importance: number;
   status: string;
   created_at: number;
 }
 
-type View = 'list' | 'grid';
-type Patch = Partial<Pick<Bookmark, 'importance' | 'note'>>;
+interface CategoryRow {
+  id: number;
+  name: string;
+  parent_id: number | null;
+  count: number;
+}
 
-const PAGE_SIZE = 50;
+interface CategoriesPayload {
+  categories: CategoryRow[];
+  uncategorized: number;
+  total: number;
+}
+
+type View = 'list' | 'grid';
+type Theme = 'light' | 'dark';
+type Scope = { kind: 'all' } | { kind: 'uncategorized' } | { kind: 'category'; id: number };
+type Patch = Partial<Pick<Bookmark, 'importance' | 'note' | 'category_id'>>;
+type MinImportance = 0 | 1 | 2;
+
+interface Filters {
+  minImportance: MinImportance;  // 0 = all, 1 = important+pinned, 2 = pinned only
+  domain: string | null;
+  year: string | null;
+}
+
+interface FacetsPayload {
+  domains: { name: string; count: number }[];
+  years: { year: string; count: number }[];
+}
+
+const EMPTY_FILTERS: Filters = { minImportance: 0, domain: null, year: null };
+
+function isFilterActive(f: Filters): boolean {
+  return f.minImportance !== 0 || f.domain !== null || f.year !== null;
+}
+
+interface CategoryNode extends CategoryRow {
+  children: CategoryNode[];
+  subtreeCount: number;  // direct + descendants
+  path: string;          // "Dev / React / Hooks"
+  depth: number;
+}
+
+const PAGE_SIZE = 25;
+const THEME_KEY = 'bm:theme';
+const SIDEBAR_KEY = 'bm:sidebar-open';
+const EXPANDED_KEY = 'bm:expanded-cats';
+
+function initialTheme(): Theme {
+  const saved = localStorage.getItem(THEME_KEY);
+  if (saved === 'light' || saved === 'dark') return saved;
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function scopeToQuery(scope: Scope): string {
+  if (scope.kind === 'all') return '__all__';
+  if (scope.kind === 'uncategorized') return '__uncategorized__';
+  return String(scope.id);
+}
+
+// Build a tree + flatten with path labels. Roll up descendant counts bottom-up.
+function buildTree(rows: CategoryRow[]): { roots: CategoryNode[]; byId: Map<number, CategoryNode> } {
+  const byId = new Map<number, CategoryNode>();
+  for (const r of rows) {
+    byId.set(r.id, { ...r, children: [], subtreeCount: r.count, path: r.name, depth: 0 });
+  }
+  const roots: CategoryNode[] = [];
+  for (const node of byId.values()) {
+    if (node.parent_id && byId.has(node.parent_id)) {
+      byId.get(node.parent_id)!.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+  // Depth + path (pre-order) and subtree counts (post-order).
+  const visit = (node: CategoryNode, depth: number, prefix: string) => {
+    node.depth = depth;
+    node.path = prefix ? `${prefix} / ${node.name}` : node.name;
+    node.children.sort((a, b) => a.name.localeCompare(b.name));
+    for (const child of node.children) visit(child, depth + 1, node.path);
+    node.subtreeCount = node.count + node.children.reduce((s, c) => s + c.subtreeCount, 0);
+  };
+  roots.sort((a, b) => a.name.localeCompare(b.name));
+  for (const r of roots) visit(r, 0, '');
+  return { roots, byId };
+}
 
 export default function App() {
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    const saved = localStorage.getItem(SIDEBAR_KEY);
+    return saved === null ? true : saved === '1';
+  });
+
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [total, setTotal] = useState(0);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const [page, setPage] = useState(0);
+  const [scope, setScope] = useState<Scope>({ kind: 'all' });
+
+  const [categoryRows, setCategoryRows] = useState<CategoryRow[]>([]);
+  const [uncategorizedCount, setUncategorizedCount] = useState(0);
+  const [libraryTotal, setLibraryTotal] = useState(0);
+
   const [view, setView] = useState<View>('list');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -30,9 +125,43 @@ export default function App() {
   const [searchResults, setSearchResults] = useState<Bookmark[] | null>(null);
   const [searching, setSearching] = useState(false);
 
-  const load = useCallback(async () => {
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
+  const [facets, setFacets] = useState<FacetsPayload>({ domains: [], years: [] });
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem(SIDEBAR_KEY, sidebarOpen ? '1' : '0');
+  }, [sidebarOpen]);
+
+  const loadCategories = useCallback(async () => {
     try {
-      const r = await fetch(`/api/bookmarks?limit=${PAGE_SIZE}&offset=0`);
+      const r = await fetch('/api/categories');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = (await r.json()) as CategoriesPayload;
+      setCategoryRows(d.categories ?? []);
+      setUncategorizedCount(d.uncategorized ?? 0);
+      setLibraryTotal(d.total ?? 0);
+    } catch {
+      // Sidebar degrades gracefully — main list still loads.
+    }
+  }, []);
+
+  const loadPage = useCallback(async (nextPage: number, nextScope: Scope, nextFilters: Filters) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({
+        limit: String(PAGE_SIZE),
+        offset: String(nextPage * PAGE_SIZE),
+        scope: scopeToQuery(nextScope),
+      });
+      if (nextFilters.minImportance > 0) params.set('min_importance', String(nextFilters.minImportance));
+      if (nextFilters.domain) params.set('domain', nextFilters.domain);
+      if (nextFilters.year) params.set('year', nextFilters.year);
+      const r = await fetch(`/api/bookmarks?${params}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = (await r.json()) as { bookmarks: Bookmark[]; total: number };
       setBookmarks(d.bookmarks ?? []);
@@ -45,28 +174,37 @@ export default function App() {
     }
   }, []);
 
-  const loadMore = useCallback(async () => {
-    if (loadingMore) return;
-    setLoadingMore(true);
+  const loadFacets = useCallback(async (nextScope: Scope) => {
     try {
-      const r = await fetch(`/api/bookmarks?limit=${PAGE_SIZE}&offset=${bookmarks.length}`);
+      const r = await fetch(`/api/bookmarks/facets?scope=${scopeToQuery(nextScope)}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = (await r.json()) as { bookmarks: Bookmark[]; total: number };
-      // Defensive de-dup: if a bookmark was added/removed between pages, the
-      // offset could slide and repeat a row. Filter by id to be safe.
-      setBookmarks((prev) => {
-        const seen = new Set(prev.map((b) => b.id));
-        return [...prev, ...(d.bookmarks ?? []).filter((b) => !seen.has(b.id))];
-      });
-      setTotal(d.total ?? 0);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setLoadingMore(false);
+      const d = (await r.json()) as FacetsPayload;
+      setFacets({ domains: d.domains ?? [], years: d.years ?? [] });
+    } catch {
+      // Filter bar degrades to empty selects — list still works.
     }
-  }, [bookmarks.length, loadingMore]);
+  }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  const refresh = useCallback(async () => {
+    await Promise.all([loadPage(page, scope, filters), loadCategories(), loadFacets(scope)]);
+  }, [loadPage, loadCategories, loadFacets, page, scope, filters]);
+
+  useEffect(() => { void loadPage(page, scope, filters); }, [loadPage, page, scope, filters]);
+  useEffect(() => { void loadCategories(); }, [loadCategories]);
+  useEffect(() => { void loadFacets(scope); }, [loadFacets, scope]);
+
+  const switchScope = useCallback((next: Scope) => {
+    setScope(next);
+    setPage(0);
+    // Clear filters on scope change — facets are about to change anyway, and a
+    // stale "domain" pick usually confuses more than it saves.
+    setFilters(EMPTY_FILTERS);
+  }, []);
+
+  const updateFilters = useCallback((patch: Partial<Filters>) => {
+    setFilters((prev) => ({ ...prev, ...patch }));
+    setPage(0);
+  }, []);
 
   useEffect(() => {
     const trimmed = query.trim();
@@ -95,8 +233,6 @@ export default function App() {
     return () => { controller.abort(); clearTimeout(timer); };
   }, [query]);
 
-  // Optimistic update: apply the patch to both lists right away, then persist.
-  // If the PATCH fails, fall back to a full reload to reconcile server state.
   const updateBookmark = useCallback(async (id: number, patch: Patch) => {
     const apply = (list: Bookmark[]) =>
       list.map((b) => (b.id === id ? { ...b, ...patch } : b));
@@ -109,10 +245,11 @@ export default function App() {
         body: JSON.stringify(patch),
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (patch.category_id !== undefined) void loadCategories();
     } catch {
-      await load();
+      await refresh();
     }
-  }, [load]);
+  }, [refresh, loadCategories]);
 
   const removeBookmark = useCallback(async (id: number) => {
     const drop = (list: Bookmark[]) => list.filter((b) => b.id !== id);
@@ -121,110 +258,590 @@ export default function App() {
     try {
       const r = await fetch(`/api/bookmarks/${id}`, { method: 'DELETE' });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      void loadCategories();
     } catch {
-      await load();
+      await refresh();
     }
-  }, [load]);
+  }, [refresh, loadCategories]);
+
+  const tree = useMemo(() => buildTree(categoryRows), [categoryRows]);
+  // Flat ordered list with paths, used by the per-card picker.
+  const flatCategories = useMemo(() => {
+    const out: CategoryNode[] = [];
+    const walk = (nodes: CategoryNode[]) => {
+      for (const n of nodes) { out.push(n); walk(n.children); }
+    };
+    walk(tree.roots);
+    return out;
+  }, [tree]);
+
+  const scopeHeading = useMemo(() => {
+    if (scope.kind === 'all') return 'All bookmarks';
+    if (scope.kind === 'uncategorized') return 'Uncategorized';
+    const node = tree.byId.get(scope.id);
+    return node ? node.path : 'Collection';
+  }, [scope, tree]);
 
   const pinned = bookmarks.filter((b) => b.importance === 2);
   const rest = bookmarks.filter((b) => b.importance !== 2);
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
-    <div className="app">
-      <header>
-        <h1>Bookmarks</h1>
-        <div className="controls">
-          <button onClick={() => setView((v) => (v === 'list' ? 'grid' : 'list'))}>
-            {view === 'list' ? 'Grid view' : 'List view'}
-          </button>
-        </div>
-      </header>
-
-      <AddForm onSaved={load} />
-
-      <input
-        type="search"
-        className="search-input"
-        placeholder="Search your library — describe what you're looking for…"
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
+    <div className={`app-shell${sidebarOpen ? '' : ' sidebar-collapsed'}`}>
+      <Sidebar
+        open={sidebarOpen}
+        onToggle={() => setSidebarOpen((v) => !v)}
+        tree={tree.roots}
+        uncategorizedCount={uncategorizedCount}
+        libraryTotal={libraryTotal}
+        scope={scope}
+        onScopeChange={switchScope}
+        onCategoriesChanged={loadCategories}
+        theme={theme}
+        onThemeToggle={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
       />
 
-      <ChatPanel />
+      <main className="app-main">
+        <header className="app-header">
+          <button
+            className="sidebar-btn"
+            onClick={() => setSidebarOpen((v) => !v)}
+            title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+            aria-label="Toggle sidebar"
+          >
+            ☰
+          </button>
+          <h1>{scopeHeading}</h1>
+          <span className="header-count">{total.toLocaleString()}</span>
+          <div className="controls">
+            <button onClick={() => setView((v) => (v === 'list' ? 'grid' : 'list'))}>
+              {view === 'list' ? 'Grid' : 'List'}
+            </button>
+          </div>
+        </header>
 
-      {loading && <p className="empty">Loading…</p>}
-      {error && <p className="empty">Error: {error}</p>}
+        <AddForm onSaved={refresh} />
 
-      {searchResults === null && !loading && !error && (
-        <TodaysPicks
-          view={view}
-          onReenriched={load}
-          onUpdate={updateBookmark}
-          onDelete={removeBookmark}
+        <input
+          type="search"
+          className="search-input"
+          placeholder="Search your library — describe what you're looking for…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+
+        {searchResults === null && (
+          <FilterBar
+            filters={filters}
+            facets={facets}
+            onChange={updateFilters}
+            onReset={() => updateFilters(EMPTY_FILTERS)}
+          />
+        )}
+
+        <ChatPanel />
+
+        {loading && <p className="empty">Loading…</p>}
+        {error && <p className="empty">Error: {error}</p>}
+
+        {searchResults === null && !loading && !error && scope.kind === 'all' && page === 0 && (
+          <TodaysPicks
+            view={view}
+            categories={flatCategories}
+            onReenriched={refresh}
+            onUpdate={updateBookmark}
+            onDelete={removeBookmark}
+          />
+        )}
+
+        {searchResults !== null ? (
+          <section>
+            <h2>
+              {searching ? 'Searching…' : `Results for "${query.trim()}"`}
+              {!searching && ` — ${searchResults.length}`}
+            </h2>
+            <BookmarkList
+              items={searchResults}
+              view={view}
+              categories={flatCategories}
+              onReenriched={refresh}
+              onUpdate={updateBookmark}
+              onDelete={removeBookmark}
+              emptyMessage={`No strong matches for "${query.trim()}". Try a longer or more specific query.`}
+            />
+          </section>
+        ) : (
+          <>
+            {!loading && !error && pinned.length > 0 && page === 0 && (
+              <section>
+                <h2>Pinned</h2>
+                <BookmarkList
+                  items={pinned}
+                  view={view}
+                  categories={flatCategories}
+                  onReenriched={refresh}
+                  onUpdate={updateBookmark}
+                  onDelete={removeBookmark}
+                />
+              </section>
+            )}
+
+            {!loading && !error && (
+              <section>
+                <h2>
+                  {page === 0 ? 'Recent' : `Page ${page + 1}`}
+                  <span className="count-hint">
+                    — {bookmarks.length} on this page · {total.toLocaleString()} total
+                  </span>
+                </h2>
+                <BookmarkList
+                  items={page === 0 ? rest : bookmarks}
+                  view={view}
+                  categories={flatCategories}
+                  onReenriched={refresh}
+                  onUpdate={updateBookmark}
+                  onDelete={removeBookmark}
+                />
+                {totalPages > 1 && (
+                  <Pagination
+                    page={page}
+                    totalPages={totalPages}
+                    onChange={setPage}
+                  />
+                )}
+              </section>
+            )}
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function Sidebar({
+  open, onToggle, tree, uncategorizedCount, libraryTotal,
+  scope, onScopeChange, onCategoriesChanged, theme, onThemeToggle,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  tree: CategoryNode[];
+  uncategorizedCount: number;
+  libraryTotal: number;
+  scope: Scope;
+  onScopeChange: (s: Scope) => void;
+  onCategoriesChanged: () => Promise<void> | void;
+  theme: Theme;
+  onThemeToggle: () => void;
+}) {
+  const [creatingUnder, setCreatingUnder] = useState<number | null | 'root-requested'>(null);
+  const [newName, setNewName] = useState('');
+  const [parsing, setParsing] = useState(false);
+  const [parseMsg, setParseMsg] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<number>>(() => {
+    try {
+      const raw = localStorage.getItem(EXPANDED_KEY);
+      return raw ? new Set(JSON.parse(raw) as number[]) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem(EXPANDED_KEY, JSON.stringify([...expanded]));
+  }, [expanded]);
+
+  const toggleExpand = (id: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const create = async (parentId: number | null) => {
+    const name = newName.trim();
+    if (!name) { setCreatingUnder(null); setNewName(''); return; }
+    try {
+      await fetch('/api/categories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, parent_id: parentId }),
+      });
+      if (parentId !== null) setExpanded((prev) => new Set(prev).add(parentId));
+      setNewName('');
+      setCreatingUnder(null);
+      await onCategoriesChanged();
+    } catch {
+      // silent — user can retry
+    }
+  };
+
+  const remove = async (id: number, name: string) => {
+    if (!confirm(`Delete "${name}"? Children and bookmarks move up to the parent.`)) return;
+    await fetch(`/api/categories/${id}`, { method: 'DELETE' });
+    if (scope.kind === 'category' && scope.id === id) onScopeChange({ kind: 'all' });
+    await onCategoriesChanged();
+  };
+
+  const parseFromTags = async () => {
+    setParsing(true);
+    setParseMsg(null);
+    try {
+      const r = await fetch('/api/categories/parse', { method: 'POST' });
+      const d = (await r.json()) as { assigned: number; categories: number };
+      setParseMsg(
+        d.assigned
+          ? `Assigned ${d.assigned} bookmark${d.assigned === 1 ? '' : 's'}; ${d.categories} categor${d.categories === 1 ? 'y' : 'ies'} total.`
+          : 'Nothing to parse — every tagged bookmark already has a category.',
+      );
+      await onCategoriesChanged();
+    } catch {
+      setParseMsg('Parse failed.');
+    } finally {
+      setParsing(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <aside className="sidebar sidebar-narrow" aria-label="Collapsed sidebar">
+        <button className="sidebar-btn" onClick={onToggle} title="Expand sidebar">☰</button>
+      </aside>
+    );
+  }
+
+  return (
+    <aside className="sidebar" aria-label="Collections">
+      <div className="sidebar-head">
+        <div className="sidebar-brand">Bookmarks</div>
+        <button className="sidebar-btn" onClick={onToggle} title="Collapse sidebar">‹</button>
+      </div>
+
+      <nav className="sidebar-nav">
+        <button
+          className={`sidebar-item${scope.kind === 'all' ? ' active' : ''}`}
+          onClick={() => onScopeChange({ kind: 'all' })}
+        >
+          <span className="sidebar-item-label">All bookmarks</span>
+          <span className="sidebar-item-count">{libraryTotal.toLocaleString()}</span>
+        </button>
+        <button
+          className={`sidebar-item${scope.kind === 'uncategorized' ? ' active' : ''}`}
+          onClick={() => onScopeChange({ kind: 'uncategorized' })}
+        >
+          <span className="sidebar-item-label">Uncategorized</span>
+          <span className="sidebar-item-count">{uncategorizedCount.toLocaleString()}</span>
+        </button>
+      </nav>
+
+      <div className="sidebar-section-head">
+        <span>Collections</span>
+        <button
+          className="sidebar-mini-btn"
+          onClick={() => setCreatingUnder('root-requested')}
+          title="New top-level collection"
+        >
+          +
+        </button>
+      </div>
+
+      {creatingUnder === 'root-requested' && (
+        <CreateInput
+          depth={0}
+          value={newName}
+          onChange={setNewName}
+          onCommit={() => create(null)}
+          onCancel={() => { setCreatingUnder(null); setNewName(''); }}
         />
       )}
 
-      {searchResults !== null ? (
-        <section>
-          <h2>
-            {searching ? 'Searching…' : `Results for "${query.trim()}"`}
-            {!searching && ` — ${searchResults.length}`}
-          </h2>
-          <BookmarkList
-            items={searchResults}
-            view={view}
-            onReenriched={load}
-            onUpdate={updateBookmark}
-            onDelete={removeBookmark}
-            emptyMessage={`No strong matches for "${query.trim()}". Try a longer or more specific query.`}
+      <nav className="sidebar-nav">
+        {tree.length === 0 && creatingUnder === null && (
+          <div className="sidebar-empty">
+            No collections yet.{' '}
+            <button className="link-btn inline" onClick={parseFromTags} disabled={parsing}>
+              {parsing ? 'Parsing…' : 'Parse from imports'}
+            </button>
+          </div>
+        )}
+        {tree.map((node) => (
+          <TreeNode
+            key={node.id}
+            node={node}
+            scope={scope}
+            expanded={expanded}
+            creatingUnder={typeof creatingUnder === 'number' ? creatingUnder : null}
+            newName={newName}
+            onScopeChange={onScopeChange}
+            onToggleExpand={toggleExpand}
+            onStartCreate={(parentId) => { setCreatingUnder(parentId); setNewName(''); }}
+            onCreate={create}
+            onCancelCreate={() => { setCreatingUnder(null); setNewName(''); }}
+            onChangeNewName={setNewName}
+            onDelete={remove}
           />
-        </section>
-      ) : (
-        <>
-          {!loading && !error && pinned.length > 0 && (
-            <section>
-              <h2>Pinned</h2>
-              <BookmarkList
-                items={pinned}
-                view={view}
-                onReenriched={load}
-                onUpdate={updateBookmark}
-                onDelete={removeBookmark}
-              />
-            </section>
-          )}
+        ))}
+      </nav>
 
-          {!loading && !error && (
-            <section>
-              <h2>Recent <span className="count-hint">— {bookmarks.length} of {total}</span></h2>
-              <BookmarkList
-                items={rest}
-                view={view}
-                onReenriched={load}
-                onUpdate={updateBookmark}
-                onDelete={removeBookmark}
-              />
-              {bookmarks.length < total && (
-                <div className="load-more-wrap">
-                  <button
-                    type="button"
-                    className="load-more"
-                    onClick={() => { void loadMore(); }}
-                    disabled={loadingMore}
-                  >
-                    {loadingMore ? 'Loading…' : `Load more (${total - bookmarks.length} left)`}
-                  </button>
-                </div>
-              )}
-            </section>
+      {tree.length > 0 && (
+        <div className="sidebar-foot-tools">
+          <button className="link-btn inline" onClick={parseFromTags} disabled={parsing}>
+            {parsing ? 'Parsing…' : 'Parse more from imports'}
+          </button>
+        </div>
+      )}
+      {parseMsg && <div className="sidebar-hint">{parseMsg}</div>}
+
+      <div className="sidebar-foot">
+        <button
+          className="theme-toggle"
+          onClick={onThemeToggle}
+          title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+        >
+          {theme === 'light' ? '☾ Dark mode' : '☀ Light mode'}
+        </button>
+      </div>
+    </aside>
+  );
+}
+
+function TreeNode({
+  node, scope, expanded, creatingUnder, newName,
+  onScopeChange, onToggleExpand, onStartCreate, onCreate, onCancelCreate, onChangeNewName, onDelete,
+}: {
+  node: CategoryNode;
+  scope: Scope;
+  expanded: Set<number>;
+  creatingUnder: number | null;
+  newName: string;
+  onScopeChange: (s: Scope) => void;
+  onToggleExpand: (id: number) => void;
+  onStartCreate: (parentId: number) => void;
+  onCreate: (parentId: number | null) => void;
+  onCancelCreate: () => void;
+  onChangeNewName: (v: string) => void;
+  onDelete: (id: number, name: string) => void;
+}) {
+  const active = scope.kind === 'category' && scope.id === node.id;
+  const isExpanded = expanded.has(node.id);
+  const hasChildren = node.children.length > 0;
+  const padding = 8 + node.depth * 14;
+
+  return (
+    <>
+      <div className={`sidebar-item-row${active ? ' active' : ''}`}>
+        <div className="sidebar-item-main" style={{ paddingLeft: padding }}>
+          {hasChildren ? (
+            <button
+              className="tree-chevron"
+              onClick={(e) => { e.stopPropagation(); onToggleExpand(node.id); }}
+              aria-label={isExpanded ? 'Collapse' : 'Expand'}
+            >
+              {isExpanded ? '▾' : '▸'}
+            </button>
+          ) : (
+            <span className="tree-chevron-spacer" />
           )}
-        </>
+          <button
+            className="sidebar-item-clickable"
+            onClick={() => onScopeChange({ kind: 'category', id: node.id })}
+          >
+            <span className="sidebar-item-label">{node.name}</span>
+            <span className="sidebar-item-count">
+              {/* Show subtree total when collapsed and non-empty; direct count otherwise. */}
+              {hasChildren && !isExpanded
+                ? node.subtreeCount.toLocaleString()
+                : node.count.toLocaleString()}
+            </span>
+          </button>
+        </div>
+        <button
+          className="sidebar-item-add"
+          onClick={() => onStartCreate(node.id)}
+          title={`New collection under "${node.name}"`}
+          aria-label={`New child of ${node.name}`}
+        >
+          +
+        </button>
+        <button
+          className="sidebar-item-del"
+          onClick={() => onDelete(node.id, node.name)}
+          title={`Delete "${node.name}"`}
+          aria-label={`Delete ${node.name}`}
+        >
+          ✕
+        </button>
+      </div>
+
+      {creatingUnder === node.id && (
+        <CreateInput
+          depth={node.depth + 1}
+          value={newName}
+          onChange={onChangeNewName}
+          onCommit={() => onCreate(node.id)}
+          onCancel={onCancelCreate}
+        />
+      )}
+
+      {isExpanded && node.children.map((child) => (
+        <TreeNode
+          key={child.id}
+          node={child}
+          scope={scope}
+          expanded={expanded}
+          creatingUnder={creatingUnder}
+          newName={newName}
+          onScopeChange={onScopeChange}
+          onToggleExpand={onToggleExpand}
+          onStartCreate={onStartCreate}
+          onCreate={onCreate}
+          onCancelCreate={onCancelCreate}
+          onChangeNewName={onChangeNewName}
+          onDelete={onDelete}
+        />
+      ))}
+    </>
+  );
+}
+
+function CreateInput({
+  depth, value, onChange, onCommit, onCancel,
+}: {
+  depth: number;
+  value: string;
+  onChange: (v: string) => void;
+  onCommit: () => void;
+  onCancel: () => void;
+}) {
+  const padding = 8 + depth * 14 + 18;  // align with label column, not chevron
+  return (
+    <div className="sidebar-create" style={{ paddingLeft: padding }}>
+      <input
+        autoFocus
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onCommit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); onCommit(); }
+          if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+        }}
+        placeholder="Collection name"
+        maxLength={64}
+      />
+    </div>
+  );
+}
+
+function Pagination({
+  page, totalPages, onChange,
+}: { page: number; totalPages: number; onChange: (p: number) => void }) {
+  const pages = buildPageList(page, totalPages);
+  return (
+    <nav className="pagination" aria-label="Pagination">
+      <button className="page-btn" onClick={() => onChange(Math.max(0, page - 1))} disabled={page === 0}>
+        ‹ Prev
+      </button>
+      {pages.map((p, i) =>
+        p === '…' ? (
+          <span key={`ellipsis-${i}`} className="page-ellipsis">…</span>
+        ) : (
+          <button
+            key={p}
+            className={`page-btn${p === page ? ' active' : ''}`}
+            onClick={() => onChange(p)}
+          >
+            {p + 1}
+          </button>
+        ),
+      )}
+      <button
+        className="page-btn"
+        onClick={() => onChange(Math.min(totalPages - 1, page + 1))}
+        disabled={page >= totalPages - 1}
+      >
+        Next ›
+      </button>
+    </nav>
+  );
+}
+
+function FilterBar({
+  filters, facets, onChange, onReset,
+}: {
+  filters: Filters;
+  facets: FacetsPayload;
+  onChange: (patch: Partial<Filters>) => void;
+  onReset: () => void;
+}) {
+  const active = isFilterActive(filters);
+  return (
+    <div className="filter-bar" aria-label="Filters">
+      <select
+        className="filter-select"
+        value={String(filters.minImportance)}
+        onChange={(e) => onChange({ minImportance: Number(e.target.value) as MinImportance })}
+        title="Filter by importance"
+      >
+        <option value="0">All</option>
+        <option value="1">Important+</option>
+        <option value="2">Pinned only</option>
+      </select>
+      <select
+        className="filter-select"
+        value={filters.domain ?? ''}
+        onChange={(e) => onChange({ domain: e.target.value || null })}
+        title="Filter by domain"
+        disabled={facets.domains.length === 0}
+      >
+        <option value="">All domains</option>
+        {facets.domains.map((d) => (
+          <option key={d.name} value={d.name}>
+            {d.name} ({d.count.toLocaleString()})
+          </option>
+        ))}
+      </select>
+      <select
+        className="filter-select"
+        value={filters.year ?? ''}
+        onChange={(e) => onChange({ year: e.target.value || null })}
+        title="Filter by year saved"
+        disabled={facets.years.length === 0}
+      >
+        <option value="">All years</option>
+        {facets.years.map((y) => (
+          <option key={y.year} value={y.year}>
+            {y.year} ({y.count.toLocaleString()})
+          </option>
+        ))}
+      </select>
+      {active && (
+        <button className="filter-clear" onClick={onReset} title="Clear all filters">
+          Clear filters
+        </button>
       )}
     </div>
   );
 }
 
-function AddForm({ onSaved }: { onSaved: () => Promise<void> }) {
+function buildPageList(current: number, total: number): (number | '…')[] {
+  const neighbors = 1;
+  const pages = new Set<number>([0, total - 1, current]);
+  for (let d = 1; d <= neighbors; d++) {
+    if (current - d >= 0) pages.add(current - d);
+    if (current + d < total) pages.add(current + d);
+  }
+  const sorted = [...pages].sort((a, b) => a - b);
+  const out: (number | '…')[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const curr = sorted[i]!;
+    out.push(curr);
+    const next = sorted[i + 1];
+    if (next !== undefined && next - curr > 1) out.push('…');
+  }
+  return out;
+}
+
+function AddForm({ onSaved }: { onSaved: () => Promise<void> | void }) {
   const [url, setUrl] = useState('');
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -252,7 +869,6 @@ function AddForm({ onSaved }: { onSaved: () => Promise<void> }) {
       );
       setUrl('');
       await onSaved();
-      // Enrichment completes ~2-3s after save. Pick up the summary/tags then.
       setTimeout(() => { void onSaved(); }, 3500);
     } catch (err) {
       setMsg(`Error: ${(err as Error).message}`);
@@ -280,6 +896,7 @@ function AddForm({ onSaved }: { onSaved: () => Promise<void> }) {
 }
 
 interface CardHandlers {
+  categories: CategoryNode[];
   onReenriched: () => Promise<void> | void;
   onUpdate: (id: number, patch: Patch) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
@@ -305,7 +922,7 @@ function BookmarkList({
 }
 
 function BookmarkCard({
-  b, onReenriched, onUpdate, onDelete,
+  b, categories, onReenriched, onUpdate, onDelete,
 }: { b: Bookmark } & CardHandlers) {
   const [busy, setBusy] = useState(false);
 
@@ -347,6 +964,11 @@ function BookmarkCard({
           <div className="summary muted-hint">Imported — click ↻ to enrich.</div>
         )}
         {renderTags(b.ai_tags)}
+        <CategoryPicker
+          value={b.category_id}
+          options={categories}
+          onChange={(next) => onUpdate(b.id, { category_id: next })}
+        />
         <NoteField
           note={b.note}
           onSave={(note) => onUpdate(b.id, { note })}
@@ -380,6 +1002,34 @@ function BookmarkCard({
   );
 }
 
+function CategoryPicker({
+  value, options, onChange,
+}: { value: number | null; options: CategoryNode[]; onChange: (next: number | null) => void }) {
+  return (
+    <select
+      className="category-select"
+      value={value === null ? 'none' : String(value)}
+      onChange={(e) => {
+        const v = e.target.value;
+        onChange(v === 'none' ? null : Number(v));
+      }}
+      title="Collection"
+    >
+      <option value="none">Uncategorized</option>
+      {options.map((o) => (
+        <option key={o.id} value={o.id}>
+          {' '.repeat(o.depth)}{o.name}
+        </option>
+      ))}
+      {/* Stale selection safety net: if the bookmark points at a category no longer in the list
+          (e.g. deleted by another tab before refresh), surface it so the select isn't blank. */}
+      {value !== null && !options.some((o) => o.id === value) && (
+        <option value={value}>(unknown #{value})</option>
+      )}
+    </select>
+  );
+}
+
 function renderTags(raw: string) {
   if (!raw) return null;
   let tags: string[] = [];
@@ -398,9 +1048,9 @@ function renderTags(raw: string) {
 }
 
 function importanceIcon(n: number): string {
-  if (n === 2) return '★';  // pinned (filled, accent color)
-  if (n === 1) return '★';  // important (filled, muted)
-  return '☆';               // normal (outline)
+  if (n === 2) return '★';
+  if (n === 1) return '★';
+  return '☆';
 }
 
 function importanceLabel(n: number): string {
@@ -491,7 +1141,7 @@ function TodaysPicks({
   };
 
   if (picks === null) return null;
-  if (!picks.length) return null;  // no picks yet — cron hasn't fired or library too thin
+  if (!picks.length) return null;
 
   return (
     <section className="picks-section">
@@ -583,7 +1233,6 @@ function ChatPanel() {
   );
 }
 
-// Render the answer text, turning [#42] citations into links to the source card below.
 function ChatAnswer({ answer, sources }: { answer: string; sources: ChatSource[] }) {
   const parts = answer.split(/(\[#\d+\])/g);
   return (
