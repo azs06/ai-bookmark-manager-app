@@ -343,6 +343,38 @@ app.delete('/:id', async (c) => {
   return c.json({ ok: true });
 });
 
+// Archive by URL — used by the Chrome extension, which tracks URLs (not ids)
+// via the /hashes cache. Mirrors DELETE /:id semantics: soft delete so the
+// enrichment metadata survives a re-save. Idempotent: missing URL returns
+// { removed: false } rather than 404.
+app.post('/remove', async (c) => {
+  const body = await c.req.json<{ url?: string }>();
+  if (!body.url) return c.json({ error: 'url required' }, 400);
+
+  const normalized = normalizeUrl(body.url);
+  const urlHash = await hashUrl(normalized);
+
+  const existing = await c.env.DB
+    .prepare(`SELECT id FROM bookmarks WHERE url_hash = ? AND status != 'archived'`)
+    .bind(urlHash)
+    .first<{ id: number }>();
+
+  if (!existing) return c.json({ ok: true, removed: false });
+
+  await c.env.DB
+    .prepare(`UPDATE bookmarks SET status = 'archived', updated_at = ? WHERE id = ?`)
+    .bind(Date.now(), existing.id)
+    .run();
+
+  c.executionCtx.waitUntil(
+    deleteEmbedding(c.env, existing.id).catch((err) => {
+      console.error('vector delete failed', err);
+    }),
+  );
+
+  return c.json({ ok: true, removed: true, id: existing.id });
+});
+
 // Scope:
 //   (missing | __all__)       → every non-archived bookmark
 //   __uncategorized__         → bookmarks with NULL category_id
