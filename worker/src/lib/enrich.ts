@@ -1,6 +1,8 @@
 import type { Env } from '../types';
 import { summarizeAndTag } from './haiku';
+import { summarizeAndTagGemma } from './gemma';
 import { embedAndUpsert } from './vector';
+import type { SummaryResult } from './prompts';
 
 const USER_AGENT = 'Mozilla/5.0 (compatible; AIBookmarks/0.1)';
 const FETCH_TIMEOUT_MS = 8000;
@@ -18,16 +20,14 @@ export async function enrich(env: Env, bookmarkId: number): Promise<void> {
 
     let summary: string | null = null;
     let tags: string[] = [];
-    if (page.excerpt && env.ANTHROPIC_API_KEY) {
-      try {
-        const ai = await summarizeAndTag(env, {
-          title: page.title ?? undefined,
-          excerpt: page.excerpt,
-        });
+    if (page.excerpt) {
+      const ai = await summarizeWithFallback(env, {
+        title: page.title ?? undefined,
+        excerpt: page.excerpt,
+      });
+      if (ai) {
         summary = ai.summary || null;
         tags = ai.tags;
-      } catch (err) {
-        console.error('haiku failed', err);
       }
     }
 
@@ -131,4 +131,37 @@ async function extractPage(url: string): Promise<ExtractedPage> {
     ogDescription: ogDescription || null,
     excerpt: excerpt || null,
   };
+}
+
+// Gemma is ~10× cheaper than Haiku and handles the vast majority of pages
+// fine. When it can't parse or the AI binding errors, fall back to Haiku so
+// the bookmark still gets enriched. Log each branch so fallback rate is
+// observable in `wrangler tail`.
+async function summarizeWithFallback(
+  env: Env,
+  input: { title?: string; excerpt: string },
+): Promise<SummaryResult | null> {
+  try {
+    const gemma = await summarizeAndTagGemma(env, input);
+    if (gemma) {
+      console.log('enrich:gemma-hit');
+      return gemma;
+    }
+  } catch (err) {
+    console.error('gemma failed', err);
+  }
+
+  if (!env.ANTHROPIC_API_KEY) {
+    console.error('enrich:both-failed (no ANTHROPIC_API_KEY for Haiku fallback)');
+    return null;
+  }
+
+  try {
+    const haiku = await summarizeAndTag(env, input);
+    console.log('enrich:haiku-fallback');
+    return haiku;
+  } catch (err) {
+    console.error('enrich:both-failed', err);
+    return null;
+  }
 }

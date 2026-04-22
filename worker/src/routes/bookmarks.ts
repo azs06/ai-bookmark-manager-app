@@ -152,6 +152,22 @@ app.get('/facets', async (c) => {
   });
 });
 
+app.get('/:id', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+  const row = await c.env.DB
+    .prepare(`
+      SELECT id, url, title, note, og_image_url, domain,
+             ai_summary, ai_tags, category_id, importance, status, created_at
+      FROM bookmarks
+      WHERE id = ?
+    `)
+    .bind(id)
+    .first();
+  if (!row) return c.json({ error: 'not found' }, 404);
+  return c.json({ bookmark: row });
+});
+
 app.patch('/:id', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
@@ -252,6 +268,52 @@ app.post('/:id/re-enrich', async (c) => {
   return c.json({ ok: true, id, queued: true });
 });
 
+// Batch-enrich bookmarks that were imported (from the Chrome extension) or
+// stuck in 'pending' (save succeeded but enrichment didn't finish). Bounded
+// per call so the client can loop and cancel; Worker stays inside subrequest
+// + CPU limits no matter how large the backlog is.
+const BATCH_DEFAULT = 20;
+const BATCH_MAX = 50;
+const BATCH_CONCURRENCY = 4;
+
+app.post('/enrich-imported', async (c) => {
+  const requested = Number(c.req.query('limit') ?? BATCH_DEFAULT);
+  const limit = Math.min(Math.max(Number.isFinite(requested) ? requested : BATCH_DEFAULT, 1), BATCH_MAX);
+
+  const rows = await c.env.DB
+    .prepare(`
+      SELECT id FROM bookmarks
+      WHERE status IN ('imported', 'pending')
+      ORDER BY created_at DESC
+      LIMIT ?
+    `)
+    .bind(limit)
+    .all<{ id: number }>();
+
+  const ids = (rows.results ?? []).map((r) => r.id);
+
+  const totalRow = await c.env.DB
+    .prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE status IN ('imported', 'pending')`)
+    .first<{ n: number }>();
+  const totalBefore = totalRow?.n ?? 0;
+
+  if (ids.length) {
+    c.executionCtx.waitUntil(runEnrichBatch(c.env, ids, BATCH_CONCURRENCY));
+  }
+
+  return c.json({
+    queued: ids.length,
+    remaining: Math.max(0, totalBefore - ids.length),
+  });
+});
+
+app.get('/pending-count', async (c) => {
+  const row = await c.env.DB
+    .prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE status IN ('imported', 'pending')`)
+    .first<{ n: number }>();
+  return c.json({ pending: row?.n ?? 0 });
+});
+
 app.delete('/:id', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
@@ -336,6 +398,27 @@ function applyFilters(
   }
 
   return { clauses, params };
+}
+
+// Simple N-at-a-time worker pool. Each slot pulls the next id off a shared
+// cursor until drained. Failures don't abort siblings — enrich() already
+// downgrades rows to 'partial' on its own, so one bad URL won't strand the
+// batch.
+async function runEnrichBatch(env: Env, ids: number[], concurrency: number): Promise<void> {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, ids.length) }, async () => {
+    while (cursor < ids.length) {
+      const i = cursor++;
+      const id = ids[i];
+      if (id === undefined) return;
+      try {
+        await enrich(env, id);
+      } catch (err) {
+        console.error('batch enrich failed', id, err);
+      }
+    }
+  });
+  await Promise.all(workers);
 }
 
 function deriveRestoredStatus(row: Pick<ExistingBookmark, 'ai_summary' | 'ai_tags' | 'content_excerpt'>): BookmarkStatus {
