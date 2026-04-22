@@ -35,10 +35,12 @@
     "enabled": true
   },
 
-  // 03:00 UTC = 09:00 Dhaka — daily picks ready before morning triage.
-  // Change this if you want a different wake-up ritual.
+  // Hourly: feed polling runs every hour. The scheduled() handler gates
+  // runDailySuggestions to hour 3 only (03:00 UTC = 09:00 Dhaka — daily
+  // picks ready before morning triage). `triggers` is an inheritable
+  // wrangler key, so the production env picks this up automatically.
   "triggers": {
-    "crons": ["0 3 * * *"]
+    "crons": ["0 * * * *"]
   },
 
   "vars": {

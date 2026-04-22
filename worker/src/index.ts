@@ -2,10 +2,12 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import bookmarks from './routes/bookmarks';
 import categories from './routes/categories';
+import feeds from './routes/feeds';
 import search from './routes/search';
 import suggestions from './routes/suggestions';
 import chat from './routes/chat';
 import { runDailySuggestions } from './lib/suggestions';
+import { pollAllFeeds } from './lib/feeds';
 import { resolveAllowedOrigin } from './lib/cors';
 import type { Env } from './types';
 
@@ -28,6 +30,7 @@ app.get('/api/health', (c) => c.json({
 
 app.route('/api/bookmarks', bookmarks);
 app.route('/api/categories', categories);
+app.route('/api/feeds', feeds);
 app.route('/api/search', search);
 app.route('/api/suggestions', suggestions);
 app.route('/api/chat', chat);
@@ -36,13 +39,23 @@ app.route('/api/chat', chat);
 // configured via `assets` in wrangler.jsonc with SPA fallback.
 export default {
   fetch: app.fetch,
-  // Cron-triggered daily picks. Failures here are logged but don't retry —
-  // tomorrow's run will regenerate. Manual refresh endpoint is the escape hatch.
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+  // Cron runs hourly. Feed polling happens every tick; the daily-picks job
+  // only runs at 03:00 UTC (09:00 Dhaka) so the morning triage ritual is
+  // preserved. Failures in either job are logged but never retried — the
+  // next hour (or day) is the retry.
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(
-      runDailySuggestions(env).catch((err) => {
-        console.error('daily suggestions failed', err);
+      pollAllFeeds(env).catch((err) => {
+        console.error('feed poll failed', err);
       }),
     );
+
+    if (new Date(event.scheduledTime).getUTCHours() === 3) {
+      ctx.waitUntil(
+        runDailySuggestions(env).catch((err) => {
+          console.error('daily suggestions failed', err);
+        }),
+      );
+    }
   },
 } satisfies ExportedHandler<Env>;
