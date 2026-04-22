@@ -40,7 +40,12 @@ app.get('/', async (c) => {
   const [keywordIds, semanticMatches] = await Promise.all([
     keywordSearch(c.env, q),
     semanticSearch(c.env, q, minScore).catch((err) => {
-      console.error('semantic search failed', err);
+      // "needs to be run remotely" is wrangler's expected local-dev message
+      // when Vectorize isn't emulated — suppress the noise so real failures
+      // stand out. Everything else still logs.
+      if (!isLocalVectorizeUnavailable(err)) {
+        console.error('semantic search failed', err);
+      }
       return [] as VecMatch[];
     }),
   ]);
@@ -118,6 +123,11 @@ async function semanticSearch(env: Env, q: string, minScore: number): Promise<Ve
   if (!vector) return [];
   const resp = await env.VECTORIZE.query(vector, { topK: TOP_K });
   return resp.matches.filter((m) => m.score >= minScore);
+}
+
+function isLocalVectorizeUnavailable(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('needs to be run remotely');
 }
 
 function matchSources(
