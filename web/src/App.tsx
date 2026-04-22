@@ -32,6 +32,24 @@ type View = 'list' | 'grid';
 type Theme = 'light' | 'dark';
 type Scope = { kind: 'all' } | { kind: 'uncategorized' } | { kind: 'category'; id: number };
 type Patch = Partial<Pick<Bookmark, 'importance' | 'note' | 'category_id'>>;
+type MinImportance = 0 | 1 | 2;
+
+interface Filters {
+  minImportance: MinImportance;  // 0 = all, 1 = important+pinned, 2 = pinned only
+  domain: string | null;
+  year: string | null;
+}
+
+interface FacetsPayload {
+  domains: { name: string; count: number }[];
+  years: { year: string; count: number }[];
+}
+
+const EMPTY_FILTERS: Filters = { minImportance: 0, domain: null, year: null };
+
+function isFilterActive(f: Filters): boolean {
+  return f.minImportance !== 0 || f.domain !== null || f.year !== null;
+}
 
 interface CategoryNode extends CategoryRow {
   children: CategoryNode[];
@@ -107,6 +125,9 @@ export default function App() {
   const [searchResults, setSearchResults] = useState<Bookmark[] | null>(null);
   const [searching, setSearching] = useState(false);
 
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
+  const [facets, setFacets] = useState<FacetsPayload>({ domains: [], years: [] });
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem(THEME_KEY, theme);
@@ -129,7 +150,7 @@ export default function App() {
     }
   }, []);
 
-  const loadPage = useCallback(async (nextPage: number, nextScope: Scope) => {
+  const loadPage = useCallback(async (nextPage: number, nextScope: Scope, nextFilters: Filters) => {
     setLoading(true);
     try {
       const params = new URLSearchParams({
@@ -137,6 +158,9 @@ export default function App() {
         offset: String(nextPage * PAGE_SIZE),
         scope: scopeToQuery(nextScope),
       });
+      if (nextFilters.minImportance > 0) params.set('min_importance', String(nextFilters.minImportance));
+      if (nextFilters.domain) params.set('domain', nextFilters.domain);
+      if (nextFilters.year) params.set('year', nextFilters.year);
       const r = await fetch(`/api/bookmarks?${params}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = (await r.json()) as { bookmarks: Bookmark[]; total: number };
@@ -150,15 +174,35 @@ export default function App() {
     }
   }, []);
 
-  const refresh = useCallback(async () => {
-    await Promise.all([loadPage(page, scope), loadCategories()]);
-  }, [loadPage, loadCategories, page, scope]);
+  const loadFacets = useCallback(async (nextScope: Scope) => {
+    try {
+      const r = await fetch(`/api/bookmarks/facets?scope=${scopeToQuery(nextScope)}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = (await r.json()) as FacetsPayload;
+      setFacets({ domains: d.domains ?? [], years: d.years ?? [] });
+    } catch {
+      // Filter bar degrades to empty selects — list still works.
+    }
+  }, []);
 
-  useEffect(() => { void loadPage(page, scope); }, [loadPage, page, scope]);
+  const refresh = useCallback(async () => {
+    await Promise.all([loadPage(page, scope, filters), loadCategories(), loadFacets(scope)]);
+  }, [loadPage, loadCategories, loadFacets, page, scope, filters]);
+
+  useEffect(() => { void loadPage(page, scope, filters); }, [loadPage, page, scope, filters]);
   useEffect(() => { void loadCategories(); }, [loadCategories]);
+  useEffect(() => { void loadFacets(scope); }, [loadFacets, scope]);
 
   const switchScope = useCallback((next: Scope) => {
     setScope(next);
+    setPage(0);
+    // Clear filters on scope change — facets are about to change anyway, and a
+    // stale "domain" pick usually confuses more than it saves.
+    setFilters(EMPTY_FILTERS);
+  }, []);
+
+  const updateFilters = useCallback((patch: Partial<Filters>) => {
+    setFilters((prev) => ({ ...prev, ...patch }));
     setPage(0);
   }, []);
 
@@ -285,6 +329,15 @@ export default function App() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
+
+        {searchResults === null && (
+          <FilterBar
+            filters={filters}
+            facets={facets}
+            onChange={updateFilters}
+            onReset={() => updateFilters(EMPTY_FILTERS)}
+          />
+        )}
 
         <ChatPanel />
 
@@ -709,6 +762,64 @@ function Pagination({
         Next ›
       </button>
     </nav>
+  );
+}
+
+function FilterBar({
+  filters, facets, onChange, onReset,
+}: {
+  filters: Filters;
+  facets: FacetsPayload;
+  onChange: (patch: Partial<Filters>) => void;
+  onReset: () => void;
+}) {
+  const active = isFilterActive(filters);
+  return (
+    <div className="filter-bar" aria-label="Filters">
+      <select
+        className="filter-select"
+        value={String(filters.minImportance)}
+        onChange={(e) => onChange({ minImportance: Number(e.target.value) as MinImportance })}
+        title="Filter by importance"
+      >
+        <option value="0">All</option>
+        <option value="1">Important+</option>
+        <option value="2">Pinned only</option>
+      </select>
+      <select
+        className="filter-select"
+        value={filters.domain ?? ''}
+        onChange={(e) => onChange({ domain: e.target.value || null })}
+        title="Filter by domain"
+        disabled={facets.domains.length === 0}
+      >
+        <option value="">All domains</option>
+        {facets.domains.map((d) => (
+          <option key={d.name} value={d.name}>
+            {d.name} ({d.count.toLocaleString()})
+          </option>
+        ))}
+      </select>
+      <select
+        className="filter-select"
+        value={filters.year ?? ''}
+        onChange={(e) => onChange({ year: e.target.value || null })}
+        title="Filter by year saved"
+        disabled={facets.years.length === 0}
+      >
+        <option value="">All years</option>
+        {facets.years.map((y) => (
+          <option key={y.year} value={y.year}>
+            {y.year} ({y.count.toLocaleString()})
+          </option>
+        ))}
+      </select>
+      {active && (
+        <button className="filter-clear" onClick={onReset} title="Clear all filters">
+          Clear filters
+        </button>
+      )}
+    </div>
   );
 }
 

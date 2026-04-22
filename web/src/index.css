@@ -402,6 +402,40 @@ body {
 }
 .search-input:focus { outline: none; border-color: var(--accent); }
 
+/* ─── Filter bar ──────────────────────────────────────────────────── */
+
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: -10px 0 22px;
+}
+.filter-select {
+  padding: 6px 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  min-width: 120px;
+  max-width: 240px;
+}
+.filter-select:focus { outline: none; border-color: var(--accent); }
+.filter-select:disabled { opacity: 0.55; cursor: not-allowed; }
+.filter-clear {
+  padding: 6px 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted-strong);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.filter-clear:hover { color: var(--text); border-color: var(--accent); }
+
 /* ─── Sections and bookmarks ──────────────────────────────────────── */
 
 section { margin-bottom: 30px; }

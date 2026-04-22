@@ -34,10 +34,15 @@ app.get('/', async (c) => {
     ? minParam
     : DEFAULT_MIN_SEMANTIC_SCORE;
 
-  // Fire keyword and semantic in parallel — neither blocks the other.
+  // Fire keyword and semantic in parallel. Semantic is allowed to fail — in
+  // local dev Vectorize often throws (empty index / no emulation), and we'd
+  // rather degrade to keyword-only than return a 500 that masks real matches.
   const [keywordIds, semanticMatches] = await Promise.all([
     keywordSearch(c.env, q),
-    semanticSearch(c.env, q, minScore),
+    semanticSearch(c.env, q, minScore).catch((err) => {
+      console.error('semantic search failed', err);
+      return [] as VecMatch[];
+    }),
   ]);
 
   // Reciprocal Rank Fusion: each ranked list contributes 1/(k + rank) per doc.

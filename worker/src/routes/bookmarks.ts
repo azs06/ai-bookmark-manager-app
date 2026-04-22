@@ -89,39 +89,14 @@ app.get('/', async (c) => {
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '50'), 1), 100);
   const offset = Math.max(Number(c.req.query('offset') ?? '0'), 0);
 
-  // Scope:
-  //   (missing | __all__)       → every non-archived bookmark
-  //   __uncategorized__         → bookmarks with NULL category_id
-  //   <numeric id>              → that category AND all its descendants (recursive CTE)
-  const scope = c.req.query('scope');
-  const categoryId = scope && scope !== '__all__' && scope !== '__uncategorized__'
-    ? Number(scope)
-    : null;
-
-  let where = `b.status != 'archived'`;
-  let from = `FROM bookmarks b`;
-  const params: unknown[] = [];
-
-  if (scope === '__uncategorized__') {
-    where += ` AND b.category_id IS NULL`;
-  } else if (categoryId !== null && Number.isFinite(categoryId)) {
-    // CTE collects the subtree, then inner-join filters bookmarks to it.
-    from = `
-      FROM bookmarks b
-      INNER JOIN (
-        WITH RECURSIVE subtree(id) AS (
-          SELECT ? UNION ALL
-          SELECT c.id FROM categories c INNER JOIN subtree s ON c.parent_id = s.id
-        )
-        SELECT id FROM subtree
-      ) sc ON sc.id = b.category_id
-    `;
-    params.push(categoryId);
-  }
+  const { from, where, params } = buildScopedWhere(c.req.query('scope'));
+  const filters = applyFilters(c.req.query('min_importance'), c.req.query('domain'), c.req.query('year'));
+  const finalWhere = filters.clauses.length ? `${where} AND ${filters.clauses.join(' AND ')}` : where;
+  const allParams = [...params, ...filters.params];
 
   const totalRow = await c.env.DB
-    .prepare(`SELECT COUNT(*) AS n ${from} WHERE ${where}`)
-    .bind(...params)
+    .prepare(`SELECT COUNT(*) AS n ${from} WHERE ${finalWhere}`)
+    .bind(...allParams)
     .first<{ n: number }>();
   const total = totalRow?.n ?? 0;
 
@@ -130,14 +105,51 @@ app.get('/', async (c) => {
       SELECT b.id, b.url, b.title, b.note, b.og_image_url, b.domain,
              b.ai_summary, b.ai_tags, b.category_id, b.importance, b.status, b.created_at
       ${from}
-      WHERE ${where}
+      WHERE ${finalWhere}
       ORDER BY b.importance DESC, b.created_at DESC, b.id DESC
       LIMIT ? OFFSET ?
     `)
-    .bind(...params, limit, offset)
+    .bind(...allParams, limit, offset)
     .all();
 
   return c.json({ bookmarks: rows.results, total, offset, limit });
+});
+
+// Facets for the filter bar. Counts reflect the current scope only (not other
+// active filters) so the lists stay stable as the user toggles filters — same
+// behavior as raindrop's collection sidebar counts.
+app.get('/facets', async (c) => {
+  const { from, where, params } = buildScopedWhere(c.req.query('scope'));
+
+  const [domains, years] = await Promise.all([
+    c.env.DB
+      .prepare(`
+        SELECT b.domain AS name, COUNT(*) AS count
+        ${from}
+        WHERE ${where} AND b.domain IS NOT NULL AND b.domain != ''
+        GROUP BY b.domain
+        ORDER BY count DESC, b.domain ASC
+        LIMIT 50
+      `)
+      .bind(...params)
+      .all<{ name: string; count: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT strftime('%Y', b.created_at / 1000, 'unixepoch') AS year,
+               COUNT(*) AS count
+        ${from}
+        WHERE ${where}
+        GROUP BY year
+        ORDER BY year DESC
+      `)
+      .bind(...params)
+      .all<{ year: string; count: number }>(),
+  ]);
+
+  return c.json({
+    domains: domains.results ?? [],
+    years: years.results ?? [],
+  });
 });
 
 app.patch('/:id', async (c) => {
@@ -257,6 +269,74 @@ app.delete('/:id', async (c) => {
 
   return c.json({ ok: true });
 });
+
+// Scope:
+//   (missing | __all__)       → every non-archived bookmark
+//   __uncategorized__         → bookmarks with NULL category_id
+//   <numeric id>              → that category AND all its descendants (recursive CTE)
+function buildScopedWhere(scope: string | undefined): {
+  from: string;
+  where: string;
+  params: unknown[];
+} {
+  const categoryId = scope && scope !== '__all__' && scope !== '__uncategorized__'
+    ? Number(scope)
+    : null;
+
+  let where = `b.status != 'archived'`;
+  let from = `FROM bookmarks b`;
+  const params: unknown[] = [];
+
+  if (scope === '__uncategorized__') {
+    where += ` AND b.category_id IS NULL`;
+  } else if (categoryId !== null && Number.isFinite(categoryId)) {
+    from = `
+      FROM bookmarks b
+      INNER JOIN (
+        WITH RECURSIVE subtree(id) AS (
+          SELECT ? UNION ALL
+          SELECT c.id FROM categories c INNER JOIN subtree s ON c.parent_id = s.id
+        )
+        SELECT id FROM subtree
+      ) sc ON sc.id = b.category_id
+    `;
+    params.push(categoryId);
+  }
+
+  return { from, where, params };
+}
+
+// Parses + validates the three filter query params. Unknown/invalid values
+// are silently dropped so a malformed URL never 500s — the list just comes
+// back unfiltered on that dimension.
+function applyFilters(
+  rawImportance: string | undefined,
+  rawDomain: string | undefined,
+  rawYear: string | undefined,
+): { clauses: string[]; params: unknown[] } {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  const minImportance = Number(rawImportance);
+  if (minImportance === 1 || minImportance === 2) {
+    clauses.push('b.importance >= ?');
+    params.push(minImportance);
+  }
+
+  const domain = rawDomain?.trim();
+  if (domain) {
+    clauses.push('b.domain = ?');
+    params.push(domain);
+  }
+
+  const year = rawYear?.trim();
+  if (year && /^\d{4}$/.test(year)) {
+    clauses.push(`strftime('%Y', b.created_at / 1000, 'unixepoch') = ?`);
+    params.push(year);
+  }
+
+  return { clauses, params };
+}
 
 function deriveRestoredStatus(row: Pick<ExistingBookmark, 'ai_summary' | 'ai_tags' | 'content_excerpt'>): BookmarkStatus {
   if (row.ai_summary) return 'active';
