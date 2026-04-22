@@ -314,6 +314,17 @@ app.get('/pending-count', async (c) => {
   return c.json({ pending: row?.n ?? 0 });
 });
 
+// Returns every non-archived bookmark's url_hash so the extension can maintain
+// a local "is this page saved?" cache without querying per-tab-change. Full
+// dump, not paginated — single-user scale and hashes compress well under gzip.
+app.get('/hashes', async (c) => {
+  const rows = await c.env.DB
+    .prepare(`SELECT url_hash FROM bookmarks WHERE status != 'archived'`)
+    .all<{ url_hash: string }>();
+  const hashes = (rows.results ?? []).map((r) => r.url_hash);
+  return c.json({ hashes, ts: Date.now() });
+});
+
 app.delete('/:id', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
