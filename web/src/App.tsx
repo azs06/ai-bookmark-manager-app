@@ -30,6 +30,7 @@ interface CategoriesPayload {
 
 type View = 'list' | 'grid';
 type Theme = 'light' | 'dark';
+type Mode = 'bookmarks' | 'feeds';
 type Scope = { kind: 'all' } | { kind: 'uncategorized' } | { kind: 'category'; id: number };
 type Patch = Partial<Pick<Bookmark, 'importance' | 'note' | 'category_id'>>;
 type MinImportance = 0 | 1 | 2;
@@ -102,8 +103,26 @@ function buildTree(rows: CategoryRow[]): { roots: CategoryNode[]; byId: Map<numb
   return { roots, byId };
 }
 
+// Deep links from the Chrome extension (and potentially bookmarks) arrive as
+// ?view=feeds&feed_id=N. Read once at startup so React state starts in the
+// right place; the extension doesn't need any client-side routing library.
+function readDeepLink(): { mode: Mode; feedId: number | null } {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('view') !== 'feeds') return { mode: 'bookmarks', feedId: null };
+    const raw = params.get('feed_id');
+    const feedId = raw && Number.isFinite(Number(raw)) ? Number(raw) : null;
+    return { mode: 'feeds', feedId };
+  } catch {
+    return { mode: 'bookmarks', feedId: null };
+  }
+}
+
+const INITIAL_DEEP_LINK = readDeepLink();
+
 export default function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [mode, setMode] = useState<Mode>(INITIAL_DEEP_LINK.mode);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
     const saved = localStorage.getItem(SIDEBAR_KEY);
     return saved === null ? true : saved === '1';
@@ -312,8 +331,10 @@ export default function App() {
         uncategorizedCount={uncategorizedCount}
         libraryTotal={libraryTotal}
         scope={scope}
-        onScopeChange={switchScope}
+        onScopeChange={(next) => { setMode('bookmarks'); switchScope(next); }}
         onCategoriesChanged={loadCategories}
+        mode={mode}
+        onModeChange={setMode}
         theme={theme}
         onThemeToggle={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
       />
@@ -328,15 +349,19 @@ export default function App() {
           >
             ☰
           </button>
-          <h1>{scopeHeading}</h1>
-          <span className="header-count">{total.toLocaleString()}</span>
-          <div className="controls">
-            <button onClick={() => setView((v) => (v === 'list' ? 'grid' : 'list'))}>
-              {view === 'list' ? 'Grid' : 'List'}
-            </button>
-          </div>
+          <h1>{mode === 'feeds' ? 'Feeds' : scopeHeading}</h1>
+          {mode === 'bookmarks' && <span className="header-count">{total.toLocaleString()}</span>}
+          {mode === 'bookmarks' && (
+            <div className="controls">
+              <button onClick={() => setView((v) => (v === 'list' ? 'grid' : 'list'))}>
+                {view === 'list' ? 'Grid' : 'List'}
+              </button>
+            </div>
+          )}
         </header>
 
+        {mode === 'feeds' && <FeedsView initialFeedId={INITIAL_DEEP_LINK.feedId} />}
+        {mode === 'bookmarks' && (<>
         <AddForm onSaved={refresh} />
 
         <EnrichBanner onProgress={refresh} />
@@ -432,6 +457,7 @@ export default function App() {
             )}
           </>
         )}
+        </>)}
       </main>
     </div>
   );
@@ -439,7 +465,7 @@ export default function App() {
 
 function Sidebar({
   open, onToggle, tree, uncategorizedCount, libraryTotal,
-  scope, onScopeChange, onCategoriesChanged, theme, onThemeToggle,
+  scope, onScopeChange, onCategoriesChanged, mode, onModeChange, theme, onThemeToggle,
 }: {
   open: boolean;
   onToggle: () => void;
@@ -449,6 +475,8 @@ function Sidebar({
   scope: Scope;
   onScopeChange: (s: Scope) => void;
   onCategoriesChanged: () => Promise<void> | void;
+  mode: Mode;
+  onModeChange: (m: Mode) => void;
   theme: Theme;
   onThemeToggle: () => void;
 }) {
@@ -456,6 +484,24 @@ function Sidebar({
   const [newName, setNewName] = useState('');
   const [parsing, setParsing] = useState(false);
   const [parseMsg, setParseMsg] = useState<string | null>(null);
+  const [feedsUnread, setFeedsUnread] = useState<number | null>(null);
+
+  // Badge refreshes on mount and when the user switches to the feeds view —
+  // the FeedsView updates the count indirectly via mode toggles after reads.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await fetch('/api/feeds');
+        if (!r.ok) return;
+        const d = (await r.json()) as { total_unread?: number };
+        if (!cancelled) setFeedsUnread(d.total_unread ?? 0);
+      } catch {
+        // Badge just won't show a number; nav still works.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [mode]);
   const [expanded, setExpanded] = useState<Set<number>>(() => {
     try {
       const raw = localStorage.getItem(EXPANDED_KEY);
@@ -538,18 +584,27 @@ function Sidebar({
 
       <nav className="sidebar-nav">
         <button
-          className={`sidebar-item${scope.kind === 'all' ? ' active' : ''}`}
+          className={`sidebar-item${mode === 'bookmarks' && scope.kind === 'all' ? ' active' : ''}`}
           onClick={() => onScopeChange({ kind: 'all' })}
         >
           <span className="sidebar-item-label">All bookmarks</span>
           <span className="sidebar-item-count">{libraryTotal.toLocaleString()}</span>
         </button>
         <button
-          className={`sidebar-item${scope.kind === 'uncategorized' ? ' active' : ''}`}
+          className={`sidebar-item${mode === 'bookmarks' && scope.kind === 'uncategorized' ? ' active' : ''}`}
           onClick={() => onScopeChange({ kind: 'uncategorized' })}
         >
           <span className="sidebar-item-label">Uncategorized</span>
           <span className="sidebar-item-count">{uncategorizedCount.toLocaleString()}</span>
+        </button>
+        <button
+          className={`sidebar-item${mode === 'feeds' ? ' active' : ''}`}
+          onClick={() => onModeChange('feeds')}
+        >
+          <span className="sidebar-item-label">Feeds</span>
+          {feedsUnread !== null && feedsUnread > 0 && (
+            <span className="sidebar-item-count">{feedsUnread.toLocaleString()}</span>
+          )}
         </button>
       </nav>
 
@@ -1356,4 +1411,435 @@ function ChatAnswer({ answer, sources }: { answer: string; sources: ChatSource[]
       )}
     </div>
   );
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Feeds view
+// ──────────────────────────────────────────────────────────────────
+
+interface Feed {
+  id: number;
+  url: string;
+  title: string | null;
+  site_url: string | null;
+  favicon_url: string | null;
+  last_fetched_at: number | null;
+  error: string | null;
+  unread_count: number;
+  total_count: number;
+}
+
+interface FeedItem {
+  id: number;
+  feed_id: number;
+  url: string | null;
+  title: string | null;
+  author: string | null;
+  published_at: number | null;
+  ai_summary: string | null;
+  read_at: number | null;
+  saved_bookmark_id: number | null;
+  feed_title: string | null;
+  feed_favicon_url: string | null;
+}
+
+interface FeedCandidate {
+  url: string;
+  title: string | null;
+  type: 'rss' | 'atom' | 'unknown';
+}
+
+// Banner state for the add-feed form. Kinds have different render/dismiss
+// rules: success auto-clears, info carries a deep-link to an existing feed,
+// candidates renders a picker, error sticks until replaced.
+type AddMsg =
+  | { kind: 'success'; text: string }
+  | { kind: 'info'; text: string; feedId?: number }
+  | { kind: 'error'; text: string }
+  | { kind: 'candidates'; candidates: FeedCandidate[]; sourceUrl: string };
+
+const FEEDS_PAGE_SIZE = 50;
+
+function FeedsView({ initialFeedId }: { initialFeedId: number | null }) {
+  const [feeds, setFeeds] = useState<Feed[]>([]);
+  const [items, setItems] = useState<FeedItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
+  const [feedFilter, setFeedFilter] = useState<number | 'all'>(initialFeedId ?? 'all');
+  const [unreadOnly, setUnreadOnly] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [addUrl, setAddUrl] = useState('');
+  const [addBusy, setAddBusy] = useState(false);
+  const [addMsg, setAddMsg] = useState<AddMsg | null>(null);
+  const [itemError, setItemError] = useState<string | null>(null);
+
+  // Success and info banners self-dismiss; errors linger until replaced.
+  useEffect(() => {
+    if (!addMsg || addMsg.kind === 'error') return;
+    const t = setTimeout(() => setAddMsg(null), 4000);
+    return () => clearTimeout(t);
+  }, [addMsg]);
+  useEffect(() => {
+    if (!itemError) return;
+    const t = setTimeout(() => setItemError(null), 5000);
+    return () => clearTimeout(t);
+  }, [itemError]);
+
+  const loadFeeds = useCallback(async () => {
+    try {
+      const r = await fetch('/api/feeds');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = (await r.json()) as { feeds: Feed[] };
+      setFeeds(d.feeds ?? []);
+    } catch {
+      // Non-fatal: the selector will show "All feeds" only.
+    }
+  }, []);
+
+  const loadItems = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({
+        limit: String(FEEDS_PAGE_SIZE),
+        offset: String(page * FEEDS_PAGE_SIZE),
+      });
+      if (feedFilter !== 'all') params.set('feed_id', String(feedFilter));
+      if (unreadOnly) params.set('unread', '1');
+      const r = await fetch(`/api/feeds/items?${params}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = (await r.json()) as { items: FeedItem[]; total: number };
+      setItems(d.items ?? []);
+      setTotal(d.total ?? 0);
+    } finally {
+      setLoading(false);
+    }
+  }, [page, feedFilter, unreadOnly]);
+
+  useEffect(() => { void loadFeeds(); }, [loadFeeds]);
+  useEffect(() => { void loadItems(); }, [loadItems]);
+
+  // A click on the title opens the URL (target=_blank) AND marks read
+  // optimistically. The server call is best-effort; on failure the row
+  // will snap back on the next load.
+  const markRead = async (id: number) => {
+    setItems((prev) => prev.map((it) => it.id === id ? { ...it, read_at: Date.now() } : it));
+    try {
+      await fetch(`/api/feeds/items/${id}/read`, { method: 'POST' });
+      void loadFeeds();  // refresh unread counts in the selector
+    } catch {
+      // Snap-back on next load; no inline error needed.
+    }
+  };
+
+  const summarize = async (id: number) => {
+    setItems((prev) => prev.map((it) => it.id === id ? { ...it, ai_summary: '__loading__' } : it));
+    try {
+      const r = await fetch(`/api/feeds/items/${id}/summarize`, { method: 'POST' });
+      const d = (await r.json()) as { ok?: boolean; summary?: string; error?: string };
+      if (!r.ok || !d.summary) throw new Error(d.error ?? `HTTP ${r.status}`);
+      setItems((prev) => prev.map((it) =>
+        it.id === id ? { ...it, ai_summary: d.summary!, read_at: it.read_at ?? Date.now() } : it,
+      ));
+      void loadFeeds();  // summarize marks-as-read → affects unread count
+    } catch (err) {
+      setItems((prev) => prev.map((it) =>
+        it.id === id ? { ...it, ai_summary: null } : it,
+      ));
+      setItemError(`Summary failed: ${(err as Error).message}`);
+    }
+  };
+
+  const markAllRead = async () => {
+    const ids = items.filter((it) => it.read_at === null).map((it) => it.id);
+    if (!ids.length) return;
+    setItems((prev) => prev.map((it) => ({ ...it, read_at: it.read_at ?? Date.now() })));
+    try {
+      await fetch('/api/feeds/items/read-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      void loadFeeds();
+      if (unreadOnly) { setPage(0); void loadItems(); }
+    } catch {
+      void loadItems();
+    }
+  };
+
+  const refreshAll = async () => {
+    setRefreshing(true);
+    try {
+      const r = await fetch('/api/feeds/refresh', { method: 'POST' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      await Promise.all([loadFeeds(), loadItems()]);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // Accepts either the URL from the input (user submit) or a pre-picked
+  // candidate URL (from the multi-feed picker). The picker path skips
+  // discovery because the backend already identified the candidate as a feed.
+  const addFeed = async (e?: FormEvent, overrideUrl?: string) => {
+    if (e) e.preventDefault();
+    const trimmed = (overrideUrl ?? addUrl).trim();
+    if (!trimmed || addBusy) return;
+    setAddBusy(true);
+    setAddMsg(null);
+    try {
+      const r = await fetch('/api/feeds', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: trimmed }),
+      });
+      const d = (await r.json()) as {
+        ok?: boolean;
+        error?: string;
+        items_added?: number;
+        feed?: { id: number; title: string | null };
+        feed_id?: number;
+        candidates?: FeedCandidate[];
+      };
+
+      if (r.status === 300 && Array.isArray(d.candidates) && d.candidates.length > 1) {
+        setAddMsg({ kind: 'candidates', candidates: d.candidates, sourceUrl: trimmed });
+        return;
+      }
+      if (r.status === 409) {
+        setAddMsg({
+          kind: 'info',
+          text: d.error ?? 'Feed already subscribed.',
+          feedId: d.feed_id,
+        });
+        return;
+      }
+      if (!r.ok) {
+        setAddMsg({ kind: 'error', text: d.error ?? `HTTP ${r.status}` });
+        return;
+      }
+
+      const title = d.feed?.title?.trim();
+      setAddMsg({
+        kind: 'success',
+        text: title
+          ? `Subscribed to ${title} — ${d.items_added ?? 0} items imported.`
+          : `Subscribed — ${d.items_added ?? 0} items imported.`,
+      });
+      setAddUrl('');
+      await Promise.all([loadFeeds(), loadItems()]);
+    } catch (err) {
+      setAddMsg({ kind: 'error', text: (err as Error).message });
+    } finally {
+      setAddBusy(false);
+    }
+  };
+
+  const unsubscribe = async (id: number, title: string | null) => {
+    if (!confirm(`Unsubscribe from "${title ?? 'this feed'}"? All its items will be removed.`)) return;
+    await fetch(`/api/feeds/${id}`, { method: 'DELETE' });
+    if (feedFilter === id) setFeedFilter('all');
+    await Promise.all([loadFeeds(), loadItems()]);
+  };
+
+  const totalPages = Math.max(1, Math.ceil(total / FEEDS_PAGE_SIZE));
+
+  return (
+    <section className="feeds-view">
+      <form onSubmit={(e) => void addFeed(e)} className="add-form">
+        <input
+          type="url"
+          value={addUrl}
+          onChange={(e) => setAddUrl(e.target.value)}
+          placeholder="Paste a feed or site URL to subscribe…"
+          disabled={addBusy}
+          autoComplete="off"
+        />
+        <button type="submit" disabled={addBusy || !addUrl.trim()}>
+          {addBusy ? 'Adding…' : 'Add feed'}
+        </button>
+        {addMsg && <AddMsgBanner
+          msg={addMsg}
+          onDismiss={() => setAddMsg(null)}
+          onPickCandidate={(url) => void addFeed(undefined, url)}
+          onViewFeed={(id) => { setFeedFilter(id); setAddMsg(null); setPage(0); }}
+        />}
+      </form>
+
+      {itemError && (
+        <div className="feed-error" role="alert">
+          {itemError}
+          <button className="link-btn" onClick={() => setItemError(null)}>Dismiss</button>
+        </div>
+      )}
+
+      <div className="feeds-toolbar">
+        <select
+          className="filter-select"
+          value={feedFilter === 'all' ? '' : String(feedFilter)}
+          onChange={(e) => { setFeedFilter(e.target.value ? Number(e.target.value) : 'all'); setPage(0); }}
+        >
+          <option value="">All feeds ({feeds.reduce((s, f) => s + f.unread_count, 0)} unread)</option>
+          {feeds.map((f) => (
+            <option key={f.id} value={f.id}>
+              {f.title ?? f.url} ({f.unread_count} unread)
+            </option>
+          ))}
+        </select>
+        <label className="feeds-toolbar-check">
+          <input
+            type="checkbox"
+            checked={unreadOnly}
+            onChange={(e) => { setUnreadOnly(e.target.checked); setPage(0); }}
+          />
+          Unread only
+        </label>
+        <button onClick={refreshAll} disabled={refreshing}>
+          {refreshing ? 'Refreshing…' : 'Refresh'}
+        </button>
+        <button onClick={markAllRead} disabled={!items.some((it) => it.read_at === null)}>
+          Mark page read
+        </button>
+        {feedFilter !== 'all' && (
+          (() => {
+            const f = feeds.find((x) => x.id === feedFilter);
+            return f ? (
+              <button className="feeds-toolbar-del" onClick={() => unsubscribe(f.id, f.title)}>
+                Unsubscribe
+              </button>
+            ) : null;
+          })()
+        )}
+      </div>
+
+      {feedFilter !== 'all' && (() => {
+        const f = feeds.find((x) => x.id === feedFilter);
+        return f?.error ? <div className="feed-error">Last poll failed: {f.error}</div> : null;
+      })()}
+
+      {loading && <p className="empty">Loading…</p>}
+      {!loading && !items.length && (
+        <p className="empty">
+          {feeds.length === 0
+            ? 'No feeds yet — paste an RSS or site URL above to subscribe.'
+            : unreadOnly ? 'Inbox zero. Nothing unread.' : 'No items.'}
+        </p>
+      )}
+
+      <ul className="feed-items">
+        {items.map((it) => (
+          <FeedItemRow
+            key={it.id}
+            item={it}
+            onMarkRead={markRead}
+            onSummarize={summarize}
+          />
+        ))}
+      </ul>
+
+      {totalPages > 1 && (
+        <Pagination page={page} totalPages={totalPages} onChange={setPage} />
+      )}
+    </section>
+  );
+}
+
+function FeedItemRow({
+  item, onMarkRead, onSummarize,
+}: {
+  item: FeedItem;
+  onMarkRead: (id: number) => void;
+  onSummarize: (id: number) => Promise<void>;
+}) {
+  const isRead = item.read_at !== null;
+  const summary = item.ai_summary;
+
+  return (
+    <li className={`feed-item${isRead ? ' read' : ''}`}>
+      <a
+        href={item.url ?? '#'}
+        target="_blank"
+        rel="noreferrer"
+        className="feed-item-title"
+        onClick={() => { if (!isRead) onMarkRead(item.id); }}
+      >
+        {item.title ?? item.url ?? '(untitled)'}
+      </a>
+      <div className="feed-item-meta">
+        <span>{item.feed_title ?? 'Feed'}</span>
+        {item.published_at && <span>· {formatFeedDate(item.published_at)}</span>}
+        {item.author && <span>· {item.author}</span>}
+        {item.saved_bookmark_id !== null && <span className="feed-item-saved">· ✓ Saved</span>}
+      </div>
+      {summary === '__loading__' ? (
+        <p className="feed-item-summary loading">Summarizing…</p>
+      ) : summary ? (
+        <p className="feed-item-summary">{summary}</p>
+      ) : (
+        <button
+          className="feed-item-summary-btn"
+          onClick={() => void onSummarize(item.id)}
+        >
+          Get summary
+        </button>
+      )}
+    </li>
+  );
+}
+
+function formatFeedDate(ts: number): string {
+  const d = new Date(ts);
+  const now = new Date();
+  const sameYear = d.getFullYear() === now.getFullYear();
+  return d.toLocaleDateString(undefined, sameYear
+    ? { month: 'short', day: 'numeric' }
+    : { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+// Renders whichever banner variant the add-form is currently in. Split out of
+// FeedsView because the candidates/picker path has enough structure to warrant
+// its own component rather than inline JSX branches.
+function AddMsgBanner({
+  msg, onDismiss, onPickCandidate, onViewFeed,
+}: {
+  msg: AddMsg;
+  onDismiss: () => void;
+  onPickCandidate: (url: string) => void;
+  onViewFeed: (feedId: number) => void;
+}) {
+  if (msg.kind === 'candidates') {
+    return (
+      <div className="add-msg add-msg-candidates">
+        <div>This page has multiple feeds. Pick one:</div>
+        <ul className="feed-candidates">
+          {msg.candidates.map((c) => (
+            <li key={c.url}>
+              <button
+                className="feed-candidate-btn"
+                onClick={() => onPickCandidate(c.url)}
+              >
+                <span className="feed-candidate-title">{c.title ?? c.url}</span>
+                <span className="feed-candidate-meta">
+                  {c.type !== 'unknown' && `${c.type.toUpperCase()} · `}{c.url}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+        <button className="link-btn" onClick={onDismiss}>Cancel</button>
+      </div>
+    );
+  }
+  if (msg.kind === 'info' && typeof msg.feedId === 'number') {
+    const feedId = msg.feedId;
+    return (
+      <div className={`add-msg add-msg-${msg.kind}`}>
+        {msg.text}{' '}
+        <button className="link-btn inline" onClick={() => onViewFeed(feedId)}>
+          View feed
+        </button>
+      </div>
+    );
+  }
+  return <div className={`add-msg add-msg-${msg.kind}`}>{msg.text}</div>;
 }
