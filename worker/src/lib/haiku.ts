@@ -1,9 +1,12 @@
 import type { Env } from '../types';
+import {
+  SUMMARIZE_TAG_SYSTEM_PROMPT,
+  buildSummarizeUserMessage,
+  parseSummarizeTagJson,
+  type SummaryResult,
+} from './prompts';
 
-export interface SummaryResult {
-  summary: string;
-  tags: string[];
-}
+export type { SummaryResult } from './prompts';
 
 export async function summarizeAndTag(
   env: Env,
@@ -23,8 +26,8 @@ export async function summarizeAndTag(
     body: JSON.stringify({
       model: 'claude-haiku-4-5',
       max_tokens: 400,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: buildUserMessage(input) }],
+      system: SUMMARIZE_TAG_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: buildSummarizeUserMessage(input) }],
     }),
   });
 
@@ -36,46 +39,7 @@ export async function summarizeAndTag(
     content: Array<{ type: string; text?: string }>;
   };
   const text = data.content.find((c) => c.type === 'text')?.text ?? '';
-  return parseResponse(text);
-}
-
-// ──────────────────────────────────────────────────────────────────
-// The two knobs below shape how your library feels. Tune them freely —
-// no other code depends on the wording.
-// ──────────────────────────────────────────────────────────────────
-
-const SYSTEM_PROMPT = `You catalogue web pages into a personal bookmark library. For each page you receive, return a neutral summary and topical tags as STRICT JSON.
-
-Output format (no code fences, no commentary, no leading text):
-{"summary": "...", "tags": ["tag1", "tag2"]}
-
-Rules:
-- summary: 1-2 sentences. Describe what the page is about and why it might be worth revisiting. Neutral, concrete voice — no marketing language, no "this article…".
-- tags: 3-5 items, lowercase, kebab-case for multi-word (e.g. "llm-evals"). Mix topical tags ("rust", "database-internals") with resource-type tags ("tutorial", "benchmark", "essay", "docs"). Avoid generic tags like "article", "web", "technology".
-- If the excerpt is clearly junk (paywall, error page, navigation only), return {"summary": "", "tags": []}.`;
-
-function buildUserMessage(input: { title?: string; excerpt: string }): string {
-  const parts: string[] = [];
-  if (input.title) parts.push(`Title: ${input.title}`);
-  parts.push('Excerpt:', input.excerpt);
-  return parts.join('\n');
-}
-
-// ──────────────────────────────────────────────────────────────────
-
-function parseResponse(text: string): SummaryResult {
-  const cleaned = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, '');
-  try {
-    const parsed = JSON.parse(cleaned) as { summary?: unknown; tags?: unknown };
-    return {
-      summary: typeof parsed.summary === 'string' ? parsed.summary : '',
-      tags: Array.isArray(parsed.tags)
-        ? parsed.tags.filter((t): t is string => typeof t === 'string')
-        : [],
-    };
-  } catch {
-    return { summary: '', tags: [] };
-  }
+  return parseSummarizeTagJson(text);
 }
 
 // ──────────────────────────────────────────────────────────────────

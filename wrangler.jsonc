@@ -21,12 +21,14 @@
   "vectorize": [
     {
       "binding": "VECTORIZE",
-      "index_name": "bookmarks-index"
+      "index_name": "bookmarks-index",
+      "remote": true
     }
   ],
 
   "ai": {
-    "binding": "AI"
+    "binding": "AI",
+    "remote": true
   },
 
   "observability": {

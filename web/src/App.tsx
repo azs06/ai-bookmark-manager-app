@@ -189,6 +189,23 @@ export default function App() {
     await Promise.all([loadPage(page, scope, filters), loadCategories(), loadFacets(scope)]);
   }, [loadPage, loadCategories, loadFacets, page, scope, filters]);
 
+  // Patch a single bookmark in place after re-enrich so the list doesn't
+  // reload wholesale — that caused every card to re-mount and the browser
+  // to lose its scroll anchor.
+  const refreshOne = useCallback(async (id: number) => {
+    try {
+      const r = await fetch(`/api/bookmarks/${id}`);
+      if (!r.ok) return;
+      const { bookmark } = (await r.json()) as { bookmark: Bookmark };
+      const apply = (list: Bookmark[]) =>
+        list.map((b) => (b.id === id ? bookmark : b));
+      setBookmarks(apply);
+      setSearchResults((prev) => (prev ? apply(prev) : prev));
+    } catch {
+      // network blip — leave the row as-is; user can click re-enrich again
+    }
+  }, []);
+
   useEffect(() => { void loadPage(page, scope, filters); }, [loadPage, page, scope, filters]);
   useEffect(() => { void loadCategories(); }, [loadCategories]);
   useEffect(() => { void loadFacets(scope); }, [loadFacets, scope]);
@@ -322,6 +339,8 @@ export default function App() {
 
         <AddForm onSaved={refresh} />
 
+        <EnrichBanner onProgress={refresh} />
+
         <input
           type="search"
           className="search-input"
@@ -348,7 +367,7 @@ export default function App() {
           <TodaysPicks
             view={view}
             categories={flatCategories}
-            onReenriched={refresh}
+            onReenriched={refreshOne}
             onUpdate={updateBookmark}
             onDelete={removeBookmark}
           />
@@ -364,7 +383,7 @@ export default function App() {
               items={searchResults}
               view={view}
               categories={flatCategories}
-              onReenriched={refresh}
+              onReenriched={refreshOne}
               onUpdate={updateBookmark}
               onDelete={removeBookmark}
               emptyMessage={`No strong matches for "${query.trim()}". Try a longer or more specific query.`}
@@ -379,7 +398,7 @@ export default function App() {
                   items={pinned}
                   view={view}
                   categories={flatCategories}
-                  onReenriched={refresh}
+                  onReenriched={refreshOne}
                   onUpdate={updateBookmark}
                   onDelete={removeBookmark}
                 />
@@ -398,7 +417,7 @@ export default function App() {
                   items={page === 0 ? rest : bookmarks}
                   view={view}
                   categories={flatCategories}
-                  onReenriched={refresh}
+                  onReenriched={refreshOne}
                   onUpdate={updateBookmark}
                   onDelete={removeBookmark}
                 />
@@ -841,6 +860,75 @@ function buildPageList(current: number, total: number): (number | '…')[] {
   return out;
 }
 
+// Drains the 'imported' + 'pending' backlog in bounded batches. The server
+// processes each batch in background via waitUntil; we poll pending-count
+// between rounds so the UI shows actual server-observed progress, not a
+// hopeful counter based on what we queued.
+function EnrichBanner({ onProgress }: { onProgress: () => Promise<void> | void }) {
+  const [pending, setPending] = useState<number | null>(null);
+  const [running, setRunning] = useState(false);
+  const stopRef = useRef(false);
+
+  const fetchPending = useCallback(async () => {
+    try {
+      const r = await fetch('/api/bookmarks/pending-count');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = (await r.json()) as { pending: number };
+      setPending(d.pending);
+    } catch {
+      setPending(null);
+    }
+  }, []);
+
+  useEffect(() => { void fetchPending(); }, [fetchPending]);
+
+  const run = async () => {
+    if (running) return;
+    stopRef.current = false;
+    setRunning(true);
+    try {
+      // Loop: each round enriches up to 20, waits for the server to finish
+      // (approx.), then checks the remaining count. Server backlog shrinking
+      // is the true progress signal — a batch can "finish queuing" quickly
+      // but take seconds to actually process.
+      while (!stopRef.current) {
+        const r = await fetch('/api/bookmarks/enrich-imported', { method: 'POST' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = (await r.json()) as { queued: number; remaining: number };
+        if (d.queued === 0) break;
+        // Wait for the background batch to land, then refresh + re-poll.
+        await new Promise((res) => setTimeout(res, 8000));
+        await Promise.all([fetchPending(), Promise.resolve(onProgress())]);
+        if (d.remaining === 0) break;
+      }
+    } catch {
+      // Swallow — user can retry; pending count will refresh on next mount.
+    } finally {
+      setRunning(false);
+      await fetchPending();
+    }
+  };
+
+  const stop = () => { stopRef.current = true; };
+
+  if (pending === null || pending === 0) return null;
+
+  return (
+    <div className="enrich-banner">
+      <span className="enrich-banner-label">
+        {running
+          ? `Enriching… ${pending.toLocaleString()} remaining`
+          : `${pending.toLocaleString()} bookmark${pending === 1 ? '' : 's'} waiting to be enriched`}
+      </span>
+      {running ? (
+        <button className="enrich-banner-btn" onClick={stop}>Stop</button>
+      ) : (
+        <button className="enrich-banner-btn" onClick={run}>Enrich all</button>
+      )}
+    </div>
+  );
+}
+
 function AddForm({ onSaved }: { onSaved: () => Promise<void> | void }) {
   const [url, setUrl] = useState('');
   const [saving, setSaving] = useState(false);
@@ -897,7 +985,7 @@ function AddForm({ onSaved }: { onSaved: () => Promise<void> | void }) {
 
 interface CardHandlers {
   categories: CategoryNode[];
-  onReenriched: () => Promise<void> | void;
+  onReenriched: (id: number) => Promise<void> | void;
   onUpdate: (id: number, patch: Patch) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
 }
@@ -934,7 +1022,7 @@ function BookmarkCard({
     } catch {
       // swallow — button just stops spinning
     }
-    setTimeout(async () => { await onReenriched(); setBusy(false); }, 3500);
+    setTimeout(async () => { await onReenriched(b.id); setBusy(false); }, 3500);
   };
 
   const cycleImportance = () => {
