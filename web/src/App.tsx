@@ -37,6 +37,29 @@ function parseVideoMetadata(raw: string | undefined | null): VideoMetadata {
   }
 }
 
+interface XPostMetadata {
+  statusId?: string;
+  author?: string | null;
+  handle?: string | null;
+  postedAt?: string | null;
+  mediaUrls?: string[];
+  likes?: number | null;
+  retweets?: number | null;
+  replies?: number | null;
+  hashtags?: string[];
+  source?: 'fxtwitter' | 'oembed';
+}
+
+function parseXPostMetadata(raw: string | undefined | null): XPostMetadata {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as XPostMetadata) : {};
+  } catch {
+    return {};
+  }
+}
+
 function formatDurationSec(sec: number | undefined): string | null {
   if (!sec || !Number.isFinite(sec) || sec <= 0) return null;
   const h = Math.floor(sec / 3600);
@@ -70,7 +93,7 @@ interface Filters {
   minImportance: MinImportance;  // 0 = all, 1 = important+pinned, 2 = pinned only
   domain: string | null;
   year: string | null;
-  contentType: 'video' | null;
+  contentType: 'video' | 'x' | null;
 }
 
 interface FacetsPayload {
@@ -921,6 +944,7 @@ function FilterBar({
 }) {
   const active = isFilterActive(filters);
   const videoFacet = facets.contentTypes.find((c) => c.name === 'video');
+  const xPostFacet = facets.contentTypes.find((c) => c.name === 'x');
   return (
     <div className="filter-bar" aria-label="Filters">
       <select
@@ -941,6 +965,16 @@ function FilterBar({
           title="Show only videos"
         >
           ▶ Videos ({videoFacet.count.toLocaleString()})
+        </button>
+      )}
+      {xPostFacet && (
+        <button
+          type="button"
+          className={`filter-chip${filters.contentType === 'x' ? ' active' : ''}`}
+          onClick={() => onChange({ contentType: filters.contentType === 'x' ? null : 'x' })}
+          title="Show only x.com posts"
+        >
+          𝕏 Posts ({xPostFacet.count.toLocaleString()})
         </button>
       )}
       <select
@@ -1175,27 +1209,37 @@ function BookmarkCard({
   };
 
   const isVideo = b.content_type === 'video';
+  const isXPost = b.content_type === 'x';
   const video = isVideo ? parseVideoMetadata(b.metadata) : null;
+  const xPost = isXPost ? parseXPostMetadata(b.metadata) : null;
   const durationLabel = video ? formatDurationSec(video.durationSec) : null;
   const isWatched = !!video?.watchedAt;
 
   const pinnedClass = b.importance === 2 ? ' pinned' : b.importance === 1 ? ' important' : '';
   const videoClass = isVideo ? ' is-video' : '';
+  const xPostClass = isXPost ? ' is-x-post' : '';
   const watchedClass = isWatched ? ' watched' : '';
 
   return (
-    <div className={`bookmark${pinnedClass}${videoClass}${watchedClass}`}>
+    <div className={`bookmark${pinnedClass}${videoClass}${xPostClass}${watchedClass}`}>
       {b.og_image_url && (
         <a href={b.url} target="_blank" rel="noreferrer" className="bookmark-thumb">
           <img src={b.og_image_url} alt="" />
           {isVideo && <span className="play-overlay" aria-hidden>▶</span>}
+          {isXPost && <span className="play-overlay" aria-hidden>𝕏</span>}
           {durationLabel && <span className="duration-badge">{durationLabel}</span>}
         </a>
       )}
       <div className="bookmark-body">
         <a href={b.url} target="_blank" rel="noreferrer" className="title">{b.title ?? b.url}</a>
         <div className="domain">
-          {video?.channel ? <span className="channel">{video.channel}</span> : b.domain}
+          {xPost?.handle ? (
+            <span className="channel">@{xPost.handle}</span>
+          ) : video?.channel ? (
+            <span className="channel">{video.channel}</span>
+          ) : (
+            b.domain
+          )}
         </div>
         {b.ai_summary && <div className="summary">{b.ai_summary}</div>}
         {!b.ai_summary && b.status === 'imported' && (
