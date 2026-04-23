@@ -594,6 +594,8 @@ section h2 {
   width: 36px;
   height: 36px;
 }
+/* The 𝕏 glyph is symmetric — undo the ▶ optical-centering nudge. */
+.bookmark.is-x-post .bookmark-thumb .play-overlay { padding-left: 0; }
 
 .bookmark .bookmark-thumb .duration-badge {
   position: absolute;

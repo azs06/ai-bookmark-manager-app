@@ -4,6 +4,7 @@ import { hashUrl, normalizeUrl } from '../lib/url';
 import { enrich } from '../lib/enrich';
 import { deleteEmbedding, embedAndUpsert } from '../lib/vector';
 import { detectYouTube } from '../lib/youtube';
+import { detectX } from '../lib/x';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -76,8 +77,13 @@ app.post('/', async (c) => {
   // async enricher is still running. enrich() will overwrite metadata with
   // richer fields (channel, duration, publishedAt) when it finishes.
   const yt = detectYouTube(normalized);
-  const contentType = yt ? 'video' : null;
-  const initialMetadata = yt ? JSON.stringify({ videoId: yt.videoId }) : '{}';
+  const xPost = !yt ? detectX(normalized) : null;
+  const contentType = yt ? 'video' : xPost ? 'x' : null;
+  const initialMetadata = yt
+    ? JSON.stringify({ videoId: yt.videoId })
+    : xPost
+      ? JSON.stringify({ statusId: xPost.statusId, ...(xPost.user ? { handle: xPost.user } : {}) })
+      : '{}';
 
   const result = await c.env.DB
     .prepare(`
@@ -476,7 +482,7 @@ function buildScopedWhere(scope: string | undefined): {
 // Parses + validates the three filter query params. Unknown/invalid values
 // are silently dropped so a malformed URL never 500s — the list just comes
 // back unfiltered on that dimension.
-const KNOWN_CONTENT_TYPES = new Set(['video']);
+const KNOWN_CONTENT_TYPES = new Set(['video', 'x']);
 
 function applyFilters(
   rawImportance: string | undefined,

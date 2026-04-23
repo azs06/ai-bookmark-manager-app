@@ -4,6 +4,7 @@ import { summarizeAndTagGemma } from './gemma';
 import { embedAndUpsert } from './vector';
 import type { SummarizeInput, SummaryResult } from './prompts';
 import { detectYouTube, fetchTranscript, fetchYouTubeMetadata } from './youtube';
+import { detectX, fetchXPostData, type XHit } from './x';
 
 const USER_AGENT = 'Mozilla/5.0 (compatible; AIBookmarks/0.1)';
 const FETCH_TIMEOUT_MS = 8000;
@@ -27,6 +28,16 @@ export async function enrich(env: Env, bookmarkId: number): Promise<void> {
         summary = ai.summary || null;
         tags = ai.tags;
       }
+    }
+
+    // Tweets skip the AI call (their text is already summary-length); use the
+    // extracted text as the summary so the existing card render, status='active'
+    // gate, and embed path all work with no further branching.
+    if (!summary && extract.contentType === 'x' && extract.excerpt) {
+      summary = extract.excerpt;
+    }
+    if (tags.length === 0 && extract.presetTags?.length) {
+      tags = extract.presetTags;
     }
 
     await env.DB.prepare(`
@@ -63,7 +74,10 @@ export async function enrich(env: Env, bookmarkId: number): Promise<void> {
         await embedAndUpsert(env, bookmarkId, {
           title: extract.title,
           summary,
-          excerpt: extract.excerpt,
+          // For tweets, summary IS the tweet text — passing it again as
+          // excerpt would feed the embedder a duplicated string and bias
+          // the vector toward repeated tokens.
+          excerpt: extract.contentType === 'x' ? null : extract.excerpt,
           videoContext: extract.videoContext,
         });
       } catch (err) {
@@ -84,16 +98,42 @@ interface EnrichmentExtract {
   ogImage: string | null;
   ogDescription: string | null;
   excerpt: string | null;
-  contentType: 'video' | null;
+  contentType: 'video' | 'x' | null;
   metadata: Record<string, unknown>;
   summarizeInput: SummarizeInput | null;
   videoContext?: { channel: string | null; durationSec: number | null };
+  // Pre-computed tags used when the AI path is skipped (e.g. tweet hashtags).
+  presetTags?: string[];
 }
 
 async function extractForEnrichment(url: string): Promise<EnrichmentExtract> {
+  const x = detectX(url);
+  if (x) return extractXPost(x);
   const yt = detectYouTube(url);
   if (yt) return extractYouTube(yt.videoId);
   return extractArticle(url);
+}
+
+// x.com branch: fxtwitter (or oEmbed fallback) is the single network call.
+// No AI summarization — the tweet text becomes summary + excerpt directly,
+// hashtags become tags. Title is set to a "Display (@handle)" line so the
+// embed text isn't 100% duplicate of the summary.
+async function extractXPost(hit: XHit): Promise<EnrichmentExtract> {
+  const data = await fetchXPostData(hit);
+  // Card layout already shows @handle in the domain row, so the title is
+  // just the display name (or @handle as a fallback when no display name).
+  const title = data.meta.author ?? (data.meta.handle ? `@${data.meta.handle}` : null);
+
+  return {
+    title,
+    ogImage: data.thumbnailUrl,
+    ogDescription: data.ogDescription,
+    excerpt: data.text,
+    contentType: 'x',
+    metadata: { ...data.meta },
+    summarizeInput: null,
+    presetTags: data.meta.hashtags,
+  };
 }
 
 // YouTube branch: oEmbed + ld+json metadata in parallel with transcript. The
