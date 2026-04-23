@@ -3,6 +3,7 @@ import type { BookmarkStatus, Env } from '../types';
 import { hashUrl, normalizeUrl } from '../lib/url';
 import { enrich } from '../lib/enrich';
 import { deleteEmbedding, embedAndUpsert } from '../lib/vector';
+import { detectYouTube } from '../lib/youtube';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -70,19 +71,27 @@ app.post('/', async (c) => {
     return c.json({ id: existing.id, duplicate: true, status: existing.status });
   }
 
+  // Stamp content_type + minimal metadata at insert time so the list view
+  // can show "Videos (N)" counts and a play-icon placeholder while the
+  // async enricher is still running. enrich() will overwrite metadata with
+  // richer fields (channel, duration, publishedAt) when it finishes.
+  const yt = detectYouTube(normalized);
+  const contentType = yt ? 'video' : null;
+  const initialMetadata = yt ? JSON.stringify({ videoId: yt.videoId }) : '{}';
+
   const result = await c.env.DB
     .prepare(`
-      INSERT INTO bookmarks (url, url_hash, title, note, domain, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+      INSERT INTO bookmarks (url, url_hash, title, note, domain, content_type, metadata, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
     `)
-    .bind(normalized, urlHash, body.title ?? null, body.note ?? '', domain, now, now)
+    .bind(normalized, urlHash, body.title ?? null, body.note ?? '', domain, contentType, initialMetadata, now, now)
     .run();
 
   const id = result.meta.last_row_id as number;
 
   c.executionCtx.waitUntil(enrich(c.env, id));
 
-  return c.json({ id, duplicate: false, status: 'pending' });
+  return c.json({ id, duplicate: false, status: 'pending', content_type: contentType });
 });
 
 app.get('/', async (c) => {
@@ -90,7 +99,12 @@ app.get('/', async (c) => {
   const offset = Math.max(Number(c.req.query('offset') ?? '0'), 0);
 
   const { from, where, params } = buildScopedWhere(c.req.query('scope'));
-  const filters = applyFilters(c.req.query('min_importance'), c.req.query('domain'), c.req.query('year'));
+  const filters = applyFilters(
+    c.req.query('min_importance'),
+    c.req.query('domain'),
+    c.req.query('year'),
+    c.req.query('content_type'),
+  );
   const finalWhere = filters.clauses.length ? `${where} AND ${filters.clauses.join(' AND ')}` : where;
   const allParams = [...params, ...filters.params];
 
@@ -103,7 +117,8 @@ app.get('/', async (c) => {
   const rows = await c.env.DB
     .prepare(`
       SELECT b.id, b.url, b.title, b.note, b.og_image_url, b.domain,
-             b.ai_summary, b.ai_tags, b.category_id, b.importance, b.status, b.created_at
+             b.ai_summary, b.ai_tags, b.category_id, b.importance, b.status,
+             b.content_type, b.metadata, b.created_at
       ${from}
       WHERE ${finalWhere}
       ORDER BY b.importance DESC, b.created_at DESC, b.id DESC
@@ -121,7 +136,7 @@ app.get('/', async (c) => {
 app.get('/facets', async (c) => {
   const { from, where, params } = buildScopedWhere(c.req.query('scope'));
 
-  const [domains, years] = await Promise.all([
+  const [domains, years, contentTypes] = await Promise.all([
     c.env.DB
       .prepare(`
         SELECT b.domain AS name, COUNT(*) AS count
@@ -144,11 +159,22 @@ app.get('/facets', async (c) => {
       `)
       .bind(...params)
       .all<{ year: string; count: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT b.content_type AS name, COUNT(*) AS count
+        ${from}
+        WHERE ${where} AND b.content_type IS NOT NULL
+        GROUP BY b.content_type
+        ORDER BY count DESC
+      `)
+      .bind(...params)
+      .all<{ name: string; count: number }>(),
   ]);
 
   return c.json({
     domains: domains.results ?? [],
     years: years.results ?? [],
+    content_types: contentTypes.results ?? [],
   });
 });
 
@@ -158,7 +184,8 @@ app.get('/:id', async (c) => {
   const row = await c.env.DB
     .prepare(`
       SELECT id, url, title, note, og_image_url, domain,
-             ai_summary, ai_tags, category_id, importance, status, created_at
+             ai_summary, ai_tags, category_id, importance, status,
+             content_type, metadata, created_at
       FROM bookmarks
       WHERE id = ?
     `)
@@ -266,6 +293,41 @@ app.post('/:id/re-enrich', async (c) => {
   if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
   c.executionCtx.waitUntil(enrich(c.env, id));
   return c.json({ ok: true, id, queued: true });
+});
+
+// Marks a video as watched / unwatched. Stored as a timestamp in
+// metadata.watchedAt so the UI can later surface "watched this week" etc.
+// Scoped to content_type='video' — trying to mark an article as watched is
+// a client bug, not a meaningful semantic, so we 400 instead of silently
+// storing the field on a non-video row.
+app.post('/:id/watched', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+
+  const body = await c.req.json<{ watched?: boolean }>();
+  if (typeof body.watched !== 'boolean') {
+    return c.json({ error: 'watched (boolean) required' }, 400);
+  }
+
+  const row = await c.env.DB
+    .prepare('SELECT content_type FROM bookmarks WHERE id = ?')
+    .bind(id)
+    .first<{ content_type: string | null }>();
+  if (!row) return c.json({ error: 'not found' }, 404);
+  if (row.content_type !== 'video') {
+    return c.json({ error: 'watched status only applies to videos' }, 400);
+  }
+
+  const now = Date.now();
+  // json_set handles both insert and overwrite of the key; json_remove
+  // drops it when unwatching so the stored JSON stays tidy.
+  const sql = body.watched
+    ? `UPDATE bookmarks SET metadata = json_set(metadata, '$.watchedAt', ?), updated_at = ? WHERE id = ?`
+    : `UPDATE bookmarks SET metadata = json_remove(metadata, '$.watchedAt'), updated_at = ? WHERE id = ?`;
+
+  await c.env.DB.prepare(sql).bind(...(body.watched ? [now, now, id] : [now, id])).run();
+
+  return c.json({ ok: true, watched: body.watched, watchedAt: body.watched ? now : null });
 });
 
 // Batch-enrich bookmarks that were imported (from the Chrome extension) or
@@ -414,10 +476,13 @@ function buildScopedWhere(scope: string | undefined): {
 // Parses + validates the three filter query params. Unknown/invalid values
 // are silently dropped so a malformed URL never 500s — the list just comes
 // back unfiltered on that dimension.
+const KNOWN_CONTENT_TYPES = new Set(['video']);
+
 function applyFilters(
   rawImportance: string | undefined,
   rawDomain: string | undefined,
   rawYear: string | undefined,
+  rawContentType: string | undefined,
 ): { clauses: string[]; params: unknown[] } {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -438,6 +503,12 @@ function applyFilters(
   if (year && /^\d{4}$/.test(year)) {
     clauses.push(`strftime('%Y', b.created_at / 1000, 'unixepoch') = ?`);
     params.push(year);
+  }
+
+  const contentType = rawContentType?.trim();
+  if (contentType && KNOWN_CONTENT_TYPES.has(contentType)) {
+    clauses.push('b.content_type = ?');
+    params.push(contentType);
   }
 
   return { clauses, params };

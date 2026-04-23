@@ -570,7 +570,48 @@ section h2 {
 }
 .bookmark .title:hover { color: var(--accent); }
 
-.bookmark .bookmark-thumb { display: block; }
+.bookmark .bookmark-thumb { display: block; position: relative; }
+
+.bookmark .bookmark-thumb .play-overlay {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 18px;
+  color: rgba(255, 255, 255, 0.95);
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  padding-left: 2px;  /* optical centering of the ▶ glyph */
+}
+.bookmarks.grid .bookmark .bookmark-thumb .play-overlay {
+  font-size: 22px;
+  width: 36px;
+  height: 36px;
+}
+
+.bookmark .bookmark-thumb .duration-badge {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  font-size: 10px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.72);
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.bookmark.watched { opacity: 0.55; }
+.bookmark.watched:hover { opacity: 0.85; }
+
+.bookmark .channel { font-weight: 500; color: var(--muted-strong); }
 
 .bookmark .domain {
   font-size: 12px;
@@ -655,6 +696,28 @@ section h2 {
 .delete-btn:hover:not(:disabled) {
   border-color: var(--danger);
   color: var(--danger);
+}
+
+.watched-btn.watched {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.filter-chip {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  color: var(--muted-strong);
+  cursor: pointer;
+}
+.filter-chip:hover { border-color: var(--accent); color: var(--text); }
+.filter-chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--surface);
 }
 
 .note-view {
