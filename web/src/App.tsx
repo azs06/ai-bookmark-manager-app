@@ -159,26 +159,59 @@ function buildTree(rows: CategoryRow[]): { roots: CategoryNode[]; byId: Map<numb
   return { roots, byId };
 }
 
-// Deep links from the Chrome extension (and potentially bookmarks) arrive as
-// ?view=feeds&feed_id=N. Read once at startup so React state starts in the
-// right place; the extension doesn't need any client-side routing library.
-function readDeepLink(): { mode: Mode; feedId: number | null } {
+// URL ↔ state mapping. Each navigable view has its own URL so refresh, share,
+// and browser back/forward all work without a routing library.
+//   /                                → all bookmarks (default landing)
+//   /bookmarks                       → all bookmarks
+//   /bookmarks?category=uncategorized → uncategorized
+//   /bookmarks?category=N            → specific category
+//   /feeds                           → feeds
+//   /feeds?feed_id=N                 → feeds, pre-filtered (read once by FeedsView)
+//
+// Legacy read-only support: /?view=feeds[&feed_id=N] is still parsed so old
+// extension links and shared URLs keep working. We never write that shape.
+interface UrlState { mode: Mode; scope: Scope; feedId: number | null }
+
+function parseCategoryParam(raw: string | null): Scope {
+  if (raw === 'uncategorized') return { kind: 'uncategorized' };
+  const id = raw !== null && Number.isFinite(Number(raw)) ? Number(raw) : null;
+  if (id !== null) return { kind: 'category', id };
+  return { kind: 'all' };
+}
+
+function readUrlState(): UrlState {
   try {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('view') !== 'feeds') return { mode: 'bookmarks', feedId: null };
-    const raw = params.get('feed_id');
-    const feedId = raw && Number.isFinite(Number(raw)) ? Number(raw) : null;
-    return { mode: 'feeds', feedId };
+    const path = window.location.pathname;
+    const p = new URLSearchParams(window.location.search);
+    if (path === '/feeds' || p.get('view') === 'feeds') {
+      const raw = p.get('feed_id');
+      const feedId = raw && Number.isFinite(Number(raw)) ? Number(raw) : null;
+      return { mode: 'feeds', scope: { kind: 'all' }, feedId };
+    }
+    return { mode: 'bookmarks', scope: parseCategoryParam(p.get('category')), feedId: null };
   } catch {
-    return { mode: 'bookmarks', feedId: null };
+    return { mode: 'bookmarks', scope: { kind: 'all' }, feedId: null };
   }
 }
 
-const INITIAL_DEEP_LINK = readDeepLink();
+// Build the full path + query for a given state. feed_id is owned by FeedsView
+// (not tracked in App state), so preserve it verbatim when we're already on
+// /feeds and writing another feeds URL.
+function buildUrl(mode: Mode, scope: Scope): string {
+  if (mode === 'feeds') {
+    const existing = new URLSearchParams(window.location.search).get('feed_id');
+    return existing ? `/feeds?feed_id=${encodeURIComponent(existing)}` : '/feeds';
+  }
+  if (scope.kind === 'uncategorized') return '/bookmarks?category=uncategorized';
+  if (scope.kind === 'category') return `/bookmarks?category=${scope.id}`;
+  return '/bookmarks';
+}
+
+const INITIAL_URL_STATE = readUrlState();
 
 export default function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
-  const [mode, setMode] = useState<Mode>(INITIAL_DEEP_LINK.mode);
+  const [mode, setMode] = useState<Mode>(INITIAL_URL_STATE.mode);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
     const saved = localStorage.getItem(SIDEBAR_KEY);
     return saved === null ? true : saved === '1';
@@ -187,7 +220,7 @@ export default function App() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
-  const [scope, setScope] = useState<Scope>({ kind: 'all' });
+  const [scope, setScope] = useState<Scope>(INITIAL_URL_STATE.scope);
 
   const [categoryRows, setCategoryRows] = useState<CategoryRow[]>([]);
   const [uncategorizedCount, setUncategorizedCount] = useState(0);
@@ -211,6 +244,34 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(SIDEBAR_KEY, sidebarOpen ? '1' : '0');
   }, [sidebarOpen]);
+
+  // Keep the URL in sync with mode/scope. On the first run we `replace` so
+  // normalizations (e.g. `/` → `/bookmarks`, or a legacy `?view=feeds` link
+  // arriving from the extension → `/feeds`) don't leave a useless back-button
+  // entry. Subsequent runs `push` so each sidebar click is a real history step.
+  const didMountUrl = useRef(false);
+  useEffect(() => {
+    const next = buildUrl(mode, scope);
+    const current = `${window.location.pathname}${window.location.search}`;
+    if (next !== current) {
+      const method = didMountUrl.current ? 'pushState' : 'replaceState';
+      window.history[method]({}, '', next);
+    }
+    didMountUrl.current = true;
+  }, [mode, scope]);
+
+  // Browser back/forward: re-derive state from the URL.
+  useEffect(() => {
+    const onPop = () => {
+      const s = readUrlState();
+      setMode(s.mode);
+      setScope(s.scope);
+      setPage(0);
+      setFilters(EMPTY_FILTERS);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
 
   const loadCategories = useCallback(async () => {
     try {
@@ -451,7 +512,7 @@ export default function App() {
           )}
         </header>
 
-        {mode === 'feeds' && <FeedsView initialFeedId={INITIAL_DEEP_LINK.feedId} />}
+        {mode === 'feeds' && <FeedsView initialFeedId={readUrlState().feedId} />}
         {mode === 'bookmarks' && (<>
         <AddForm onSaved={refresh} />
 
@@ -560,7 +621,8 @@ export default function App() {
 
 function Sidebar({
   open, onToggle, tree, uncategorizedCount, libraryTotal,
-  scope, onScopeChange, onCategoriesChanged, mode, onModeChange, theme, onThemeToggle,
+  scope, onScopeChange, onCategoriesChanged, mode, onModeChange,
+  theme, onThemeToggle,
 }: {
   open: boolean;
   onToggle: () => void;
