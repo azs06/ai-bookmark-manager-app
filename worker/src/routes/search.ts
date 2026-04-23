@@ -22,6 +22,8 @@ interface HydratedRow {
   ai_tags: string;
   importance: number;
   status: string;
+  content_type: string | null;
+  metadata: string;
   created_at: number;
 }
 
@@ -73,7 +75,7 @@ app.get('/', async (c) => {
   const rows = await c.env.DB
     .prepare(`
       SELECT id, url, title, note, og_image_url, domain, ai_summary, ai_tags,
-             importance, status, created_at
+             importance, status, content_type, metadata, created_at
       FROM bookmarks
       WHERE id IN (${placeholders}) AND status != 'archived'
     `)

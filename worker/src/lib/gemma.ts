@@ -1,8 +1,9 @@
 import type { Env } from '../types';
 import {
-  SUMMARIZE_TAG_SYSTEM_PROMPT,
   buildSummarizeUserMessage,
   parseSummarizeTagJson,
+  pickSystemPrompt,
+  type SummarizeInput,
   type SummaryResult,
 } from './prompts';
 
@@ -23,7 +24,7 @@ const MAX_OUTPUT_TOKENS = 400;
 // require flipping to a debugger.
 export async function summarizeAndTagGemma(
   env: Env,
-  input: { title?: string; excerpt: string },
+  input: SummarizeInput,
 ): Promise<SummaryResult | null> {
   if (!env.AI) {
     console.warn('gemma: no AI binding');
@@ -32,7 +33,7 @@ export async function summarizeAndTagGemma(
 
   const resp = await env.AI.run(MODEL, {
     messages: [
-      { role: 'system', content: SUMMARIZE_TAG_SYSTEM_PROMPT },
+      { role: 'system', content: pickSystemPrompt(input.kind) },
       { role: 'user', content: buildSummarizeUserMessage(input) },
     ],
     max_tokens: MAX_OUTPUT_TOKENS,

@@ -12,7 +12,38 @@ interface Bookmark {
   og_image_url: string | null;
   importance: number;
   status: string;
+  content_type: string | null;
+  metadata: string;  // raw JSON string; parse lazily in the card
   created_at: number;
+}
+
+interface VideoMetadata {
+  videoId?: string;
+  channel?: string;
+  durationSec?: number;
+  publishedAt?: string;
+  watchedAt?: number;
+  captionsAvailable?: boolean;
+  captionsAuto?: boolean;
+}
+
+function parseVideoMetadata(raw: string | undefined | null): VideoMetadata {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as VideoMetadata) : {};
+  } catch {
+    return {};
+  }
+}
+
+function formatDurationSec(sec: number | undefined): string | null {
+  if (!sec || !Number.isFinite(sec) || sec <= 0) return null;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
 interface CategoryRow {
@@ -39,17 +70,19 @@ interface Filters {
   minImportance: MinImportance;  // 0 = all, 1 = important+pinned, 2 = pinned only
   domain: string | null;
   year: string | null;
+  contentType: 'video' | null;
 }
 
 interface FacetsPayload {
   domains: { name: string; count: number }[];
   years: { year: string; count: number }[];
+  contentTypes: { name: string; count: number }[];
 }
 
-const EMPTY_FILTERS: Filters = { minImportance: 0, domain: null, year: null };
+const EMPTY_FILTERS: Filters = { minImportance: 0, domain: null, year: null, contentType: null };
 
 function isFilterActive(f: Filters): boolean {
-  return f.minImportance !== 0 || f.domain !== null || f.year !== null;
+  return f.minImportance !== 0 || f.domain !== null || f.year !== null || f.contentType !== null;
 }
 
 interface CategoryNode extends CategoryRow {
@@ -145,7 +178,7 @@ export default function App() {
   const [searching, setSearching] = useState(false);
 
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
-  const [facets, setFacets] = useState<FacetsPayload>({ domains: [], years: [] });
+  const [facets, setFacets] = useState<FacetsPayload>({ domains: [], years: [], contentTypes: [] });
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -180,6 +213,7 @@ export default function App() {
       if (nextFilters.minImportance > 0) params.set('min_importance', String(nextFilters.minImportance));
       if (nextFilters.domain) params.set('domain', nextFilters.domain);
       if (nextFilters.year) params.set('year', nextFilters.year);
+      if (nextFilters.contentType) params.set('content_type', nextFilters.contentType);
       const r = await fetch(`/api/bookmarks?${params}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = (await r.json()) as { bookmarks: Bookmark[]; total: number };
@@ -197,8 +231,16 @@ export default function App() {
     try {
       const r = await fetch(`/api/bookmarks/facets?scope=${scopeToQuery(nextScope)}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = (await r.json()) as FacetsPayload;
-      setFacets({ domains: d.domains ?? [], years: d.years ?? [] });
+      const d = (await r.json()) as {
+        domains?: FacetsPayload['domains'];
+        years?: FacetsPayload['years'];
+        content_types?: FacetsPayload['contentTypes'];
+      };
+      setFacets({
+        domains: d.domains ?? [],
+        years: d.years ?? [],
+        contentTypes: d.content_types ?? [],
+      });
     } catch {
       // Filter bar degrades to empty selects — list still works.
     }
@@ -286,6 +328,32 @@ export default function App() {
       await refresh();
     }
   }, [refresh, loadCategories]);
+
+  // Video-only: flip watchedAt on/off. Optimistic update edits the raw
+  // metadata JSON in state so the card re-renders dimmed immediately; a
+  // failing POST reverts via refresh().
+  const toggleWatched = useCallback(async (id: number, watched: boolean) => {
+    const mutate = (list: Bookmark[]) =>
+      list.map((b) => {
+        if (b.id !== id) return b;
+        const meta = parseVideoMetadata(b.metadata);
+        if (watched) meta.watchedAt = Date.now();
+        else delete meta.watchedAt;
+        return { ...b, metadata: JSON.stringify(meta) };
+      });
+    setBookmarks(mutate);
+    setSearchResults((prev) => (prev ? mutate(prev) : prev));
+    try {
+      const r = await fetch(`/api/bookmarks/${id}/watched`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ watched }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    } catch {
+      await refresh();
+    }
+  }, [refresh]);
 
   const removeBookmark = useCallback(async (id: number) => {
     const drop = (list: Bookmark[]) => list.filter((b) => b.id !== id);
@@ -395,6 +463,7 @@ export default function App() {
             onReenriched={refreshOne}
             onUpdate={updateBookmark}
             onDelete={removeBookmark}
+            onToggleWatched={toggleWatched}
           />
         )}
 
@@ -411,6 +480,7 @@ export default function App() {
               onReenriched={refreshOne}
               onUpdate={updateBookmark}
               onDelete={removeBookmark}
+              onToggleWatched={toggleWatched}
               emptyMessage={`No strong matches for "${query.trim()}". Try a longer or more specific query.`}
             />
           </section>
@@ -426,6 +496,7 @@ export default function App() {
                   onReenriched={refreshOne}
                   onUpdate={updateBookmark}
                   onDelete={removeBookmark}
+                  onToggleWatched={toggleWatched}
                 />
               </section>
             )}
@@ -445,6 +516,7 @@ export default function App() {
                   onReenriched={refreshOne}
                   onUpdate={updateBookmark}
                   onDelete={removeBookmark}
+                  onToggleWatched={toggleWatched}
                 />
                 {totalPages > 1 && (
                   <Pagination
@@ -848,6 +920,7 @@ function FilterBar({
   onReset: () => void;
 }) {
   const active = isFilterActive(filters);
+  const videoFacet = facets.contentTypes.find((c) => c.name === 'video');
   return (
     <div className="filter-bar" aria-label="Filters">
       <select
@@ -860,6 +933,16 @@ function FilterBar({
         <option value="1">Important+</option>
         <option value="2">Pinned only</option>
       </select>
+      {videoFacet && (
+        <button
+          type="button"
+          className={`filter-chip${filters.contentType === 'video' ? ' active' : ''}`}
+          onClick={() => onChange({ contentType: filters.contentType === 'video' ? null : 'video' })}
+          title="Show only videos"
+        >
+          ▶ Videos ({videoFacet.count.toLocaleString()})
+        </button>
+      )}
       <select
         className="filter-select"
         value={filters.domain ?? ''}
@@ -1043,6 +1126,7 @@ interface CardHandlers {
   onReenriched: (id: number) => Promise<void> | void;
   onUpdate: (id: number, patch: Patch) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
+  onToggleWatched: (id: number, watched: boolean) => Promise<void>;
 }
 
 function BookmarkList({
@@ -1065,7 +1149,7 @@ function BookmarkList({
 }
 
 function BookmarkCard({
-  b, categories, onReenriched, onUpdate, onDelete,
+  b, categories, onReenriched, onUpdate, onDelete, onToggleWatched,
 }: { b: Bookmark } & CardHandlers) {
   const [busy, setBusy] = useState(false);
 
@@ -1090,18 +1174,29 @@ function BookmarkCard({
     void onDelete(b.id);
   };
 
+  const isVideo = b.content_type === 'video';
+  const video = isVideo ? parseVideoMetadata(b.metadata) : null;
+  const durationLabel = video ? formatDurationSec(video.durationSec) : null;
+  const isWatched = !!video?.watchedAt;
+
   const pinnedClass = b.importance === 2 ? ' pinned' : b.importance === 1 ? ' important' : '';
+  const videoClass = isVideo ? ' is-video' : '';
+  const watchedClass = isWatched ? ' watched' : '';
 
   return (
-    <div className={`bookmark${pinnedClass}`}>
+    <div className={`bookmark${pinnedClass}${videoClass}${watchedClass}`}>
       {b.og_image_url && (
         <a href={b.url} target="_blank" rel="noreferrer" className="bookmark-thumb">
           <img src={b.og_image_url} alt="" />
+          {isVideo && <span className="play-overlay" aria-hidden>▶</span>}
+          {durationLabel && <span className="duration-badge">{durationLabel}</span>}
         </a>
       )}
       <div className="bookmark-body">
         <a href={b.url} target="_blank" rel="noreferrer" className="title">{b.title ?? b.url}</a>
-        <div className="domain">{b.domain}</div>
+        <div className="domain">
+          {video?.channel ? <span className="channel">{video.channel}</span> : b.domain}
+        </div>
         {b.ai_summary && <div className="summary">{b.ai_summary}</div>}
         {!b.ai_summary && b.status === 'imported' && (
           <div className="summary muted-hint">Imported — click ↻ to enrich.</div>
@@ -1125,6 +1220,15 @@ function BookmarkCard({
         >
           {importanceIcon(b.importance)}
         </button>
+        {isVideo && (
+          <button
+            className={`icon-btn watched-btn${isWatched ? ' watched' : ''}`}
+            onClick={() => void onToggleWatched(b.id, !isWatched)}
+            title={isWatched ? 'Watched — click to mark unwatched' : 'Mark as watched'}
+          >
+            {isWatched ? '✓' : '◯'}
+          </button>
+        )}
         <button
           className="icon-btn reenrich-btn"
           onClick={reenrich}

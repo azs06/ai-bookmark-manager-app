@@ -1,8 +1,9 @@
 import type { Env } from '../types';
 import {
-  SUMMARIZE_TAG_SYSTEM_PROMPT,
   buildSummarizeUserMessage,
   parseSummarizeTagJson,
+  pickSystemPrompt,
+  type SummarizeInput,
   type SummaryResult,
 } from './prompts';
 
@@ -10,7 +11,7 @@ export type { SummaryResult } from './prompts';
 
 export async function summarizeAndTag(
   env: Env,
-  input: { title?: string; excerpt: string },
+  input: SummarizeInput,
 ): Promise<SummaryResult> {
   if (!env.ANTHROPIC_API_KEY) {
     throw new Error('ANTHROPIC_API_KEY is not configured');
@@ -26,7 +27,7 @@ export async function summarizeAndTag(
     body: JSON.stringify({
       model: 'claude-haiku-4-5',
       max_tokens: 400,
-      system: SUMMARIZE_TAG_SYSTEM_PROMPT,
+      system: pickSystemPrompt(input.kind),
       messages: [{ role: 'user', content: buildSummarizeUserMessage(input) }],
     }),
   });

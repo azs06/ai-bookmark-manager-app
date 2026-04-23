@@ -19,15 +19,18 @@ CREATE TABLE IF NOT EXISTS bookmarks (
   last_viewed_at  INTEGER,
   content_excerpt TEXT,
   status          TEXT    NOT NULL DEFAULT 'pending', -- pending, active, partial, failed, imported, archived
+  content_type    TEXT,                                -- 'video' | NULL (future: 'podcast', 'pdf', …)
+  metadata        TEXT    NOT NULL DEFAULT '{}',       -- JSON bag for type-specific fields
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at  ON bookmarks(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_bookmarks_importance  ON bookmarks(importance DESC, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_bookmarks_status      ON bookmarks(status);
-CREATE INDEX IF NOT EXISTS idx_bookmarks_domain      ON bookmarks(domain);
-CREATE INDEX IF NOT EXISTS idx_bookmarks_category_id ON bookmarks(category_id);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_created_at   ON bookmarks(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_importance   ON bookmarks(importance DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_status       ON bookmarks(status);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_domain       ON bookmarks(domain);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_category_id  ON bookmarks(category_id);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_content_type ON bookmarks(content_type);
 
 -- Raindrop-style hierarchical collections. parent_id = NULL → top-level.
 -- ON DELETE of a category: bookmarks go to "Uncategorized" (ON DELETE SET NULL
