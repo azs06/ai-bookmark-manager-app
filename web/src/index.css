@@ -52,7 +52,7 @@ body {
 }
 
 .app-shell.sidebar-collapsed {
-  grid-template-columns: 48px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .sidebar {
@@ -66,12 +66,6 @@ body {
   top: 0;
   height: 100vh;
   overflow-y: auto;
-}
-
-.sidebar-narrow {
-  padding: 12px 6px;
-  align-items: center;
-  gap: 8px;
 }
 
 .sidebar-head {
@@ -345,8 +339,6 @@ body {
 }
 .controls button:hover { border-color: var(--border-strong); }
 
-/* App header's sidebar toggle only appears when the sidebar is collapsed (on
-   wider screens) or at all widths as a quick reopener. */
 .app-header .sidebar-btn { margin-left: -4px; }
 
 /* ─── Form, search ────────────────────────────────────────────────── */

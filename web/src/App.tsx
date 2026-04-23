@@ -662,13 +662,7 @@ function Sidebar({
     }
   };
 
-  if (!open) {
-    return (
-      <aside className="sidebar sidebar-narrow" aria-label="Collapsed sidebar">
-        <button className="sidebar-btn" onClick={onToggle} title="Expand sidebar">☰</button>
-      </aside>
-    );
-  }
+  if (!open) return null;
 
   return (
     <aside className="sidebar" aria-label="Collections">
