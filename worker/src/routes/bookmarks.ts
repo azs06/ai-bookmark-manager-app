@@ -5,6 +5,7 @@ import { enrich } from '../lib/enrich';
 import { deleteEmbedding, embedAndUpsert } from '../lib/vector';
 import { detectYouTube } from '../lib/youtube';
 import { detectX } from '../lib/x';
+import { probeUrl } from '../lib/health';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -184,7 +185,11 @@ app.get('/facets', async (c) => {
   });
 });
 
-app.get('/:id', async (c) => {
+// `:id{[0-9]+}` constrains the param to digits so non-numeric single-segment
+// GETs (/dead, /pending-count, /hashes) fall through to their static handlers
+// instead of being swallowed here. Without the constraint, Hono's router
+// matches /:id first by registration order and returns "invalid id" 400s.
+app.get('/:id{[0-9]+}', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
   const row = await c.env.DB
@@ -380,6 +385,124 @@ app.get('/pending-count', async (c) => {
     .prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE status IN ('imported', 'pending')`)
     .first<{ n: number }>();
   return c.json({ pending: row?.n ?? 0 });
+});
+
+// URL-health scanner. Probes up to `limit` non-archived bookmarks per call;
+// the client is expected to loop until `remaining === 0`. The `since` cursor
+// (epoch ms; pass the timestamp the client started its sweep) lets us skip
+// rows already checked in this sweep, so the loop terminates even though we
+// rewrite last_checked_at on every probe. Strict 404/410 → "dead"; everything
+// else (including network failures, recorded as 0) just gets the timestamp.
+const HEALTH_BATCH_DEFAULT = 25;
+const HEALTH_BATCH_MAX = 50;
+const HEALTH_BATCH_CONCURRENCY = 8;
+
+app.post('/check-health', async (c) => {
+  const requested = Number(c.req.query('limit') ?? HEALTH_BATCH_DEFAULT);
+  const limit = Math.min(
+    Math.max(Number.isFinite(requested) ? requested : HEALTH_BATCH_DEFAULT, 1),
+    HEALTH_BATCH_MAX,
+  );
+  const sinceRaw = Number(c.req.query('since'));
+  const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? sinceRaw : Date.now();
+
+  const rows = await c.env.DB
+    .prepare(`
+      SELECT id, url FROM bookmarks
+      WHERE status != 'archived'
+        AND (last_checked_at IS NULL OR last_checked_at < ?)
+      ORDER BY last_checked_at IS NULL DESC, last_checked_at ASC
+      LIMIT ?
+    `)
+    .bind(since, limit)
+    .all<{ id: number; url: string }>();
+
+  const targets = rows.results ?? [];
+
+  const remainingRow = await c.env.DB
+    .prepare(`
+      SELECT COUNT(*) AS n FROM bookmarks
+      WHERE status != 'archived'
+        AND (last_checked_at IS NULL OR last_checked_at < ?)
+    `)
+    .bind(since)
+    .first<{ n: number }>();
+  const remainingBefore = remainingRow?.n ?? 0;
+
+  let dead = 0;
+
+  if (targets.length) {
+    let cursor = 0;
+    const workers = Array.from(
+      { length: Math.min(HEALTH_BATCH_CONCURRENCY, targets.length) },
+      async () => {
+        while (cursor < targets.length) {
+          const i = cursor++;
+          const row = targets[i];
+          if (!row) return;
+          const status = await probeUrl(row.url);
+          if (status === 404 || status === 410) dead++;
+          await c.env.DB
+            .prepare('UPDATE bookmarks SET http_status = ?, last_checked_at = ? WHERE id = ?')
+            .bind(status, Date.now(), row.id)
+            .run();
+        }
+      },
+    );
+    await Promise.all(workers);
+  }
+
+  return c.json({
+    checked: targets.length,
+    dead,
+    remaining: Math.max(0, remainingBefore - targets.length),
+  });
+});
+
+// Lists every bookmark that came back 404 or 410 on its last probe. Returns
+// minimal fields — the dead-links UI only needs to render a row + checkbox.
+app.get('/dead', async (c) => {
+  const rows = await c.env.DB
+    .prepare(`
+      SELECT id, url, title, domain, http_status, last_checked_at, created_at
+      FROM bookmarks
+      WHERE status != 'archived'
+        AND http_status IN (404, 410)
+      ORDER BY domain ASC, created_at DESC
+    `)
+    .all();
+  return c.json({ bookmarks: rows.results ?? [] });
+});
+
+// Bulk soft-delete by id. Mirrors DELETE /:id semantics (status='archived' +
+// vector cleanup) so an archived-here bookmark behaves the same as one
+// archived from the card menu — including being restorable via re-save.
+app.post('/archive-bulk', async (c) => {
+  const body = await c.req.json<{ ids?: unknown }>();
+  if (!Array.isArray(body.ids)) return c.json({ error: 'ids (array) required' }, 400);
+  const ids = body.ids
+    .map((v) => Number(v))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (!ids.length) return c.json({ error: 'no valid ids' }, 400);
+  if (ids.length > 500) return c.json({ error: 'max 500 ids per call' }, 400);
+
+  const now = Date.now();
+  const placeholders = ids.map(() => '?').join(',');
+  const result = await c.env.DB
+    .prepare(`
+      UPDATE bookmarks SET status = 'archived', updated_at = ?
+      WHERE id IN (${placeholders}) AND status != 'archived'
+    `)
+    .bind(now, ...ids)
+    .run();
+
+  c.executionCtx.waitUntil(
+    Promise.all(ids.map((id) => deleteEmbedding(c.env, id).catch((err) => {
+      console.error('vector delete failed', id, err);
+    }))).then(() => undefined),
+  );
+
+  return c.json({ archived: result.meta.changes ?? 0 });
 });
 
 // Returns every non-archived bookmark's url_hash so the extension can maintain

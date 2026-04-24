@@ -84,7 +84,7 @@ interface CategoriesPayload {
 
 type View = 'list' | 'grid';
 type Theme = 'light' | 'dark';
-type Mode = 'bookmarks' | 'feeds';
+type Mode = 'bookmarks' | 'feeds' | 'settings';
 type Scope = { kind: 'all' } | { kind: 'uncategorized' } | { kind: 'category'; id: number };
 type Patch = Partial<Pick<Bookmark, 'importance' | 'note' | 'category_id'>>;
 type MinImportance = 0 | 1 | 2;
@@ -167,6 +167,7 @@ function buildTree(rows: CategoryRow[]): { roots: CategoryNode[]; byId: Map<numb
 //   /bookmarks?category=N            → specific category
 //   /feeds                           → feeds
 //   /feeds?feed_id=N                 → feeds, pre-filtered (read once by FeedsView)
+//   /settings                        → app-level maintenance tools (URL health, …)
 //
 // Legacy read-only support: /?view=feeds[&feed_id=N] is still parsed so old
 // extension links and shared URLs keep working. We never write that shape.
@@ -183,6 +184,9 @@ function readUrlState(): UrlState {
   try {
     const path = window.location.pathname;
     const p = new URLSearchParams(window.location.search);
+    if (path === '/settings') {
+      return { mode: 'settings', scope: { kind: 'all' }, feedId: null };
+    }
     if (path === '/feeds' || p.get('view') === 'feeds') {
       const raw = p.get('feed_id');
       const feedId = raw && Number.isFinite(Number(raw)) ? Number(raw) : null;
@@ -198,6 +202,7 @@ function readUrlState(): UrlState {
 // (not tracked in App state), so preserve it verbatim when we're already on
 // /feeds and writing another feeds URL.
 function buildUrl(mode: Mode, scope: Scope): string {
+  if (mode === 'settings') return '/settings';
   if (mode === 'feeds') {
     const existing = new URLSearchParams(window.location.search).get('feed_id');
     return existing ? `/feeds?feed_id=${encodeURIComponent(existing)}` : '/feeds';
@@ -536,7 +541,7 @@ export default function App() {
           >
             ☰
           </button>
-          <h1>{mode === 'feeds' ? 'Feeds' : scopeHeading}</h1>
+          <h1>{mode === 'feeds' ? 'Feeds' : mode === 'settings' ? 'Settings' : scopeHeading}</h1>
           {mode === 'bookmarks' && <span className="header-count">{total.toLocaleString()}</span>}
           {mode === 'bookmarks' && (
             <div className="controls">
@@ -547,6 +552,7 @@ export default function App() {
           )}
         </header>
 
+        {mode === 'settings' && <SettingsView onArchived={refresh} />}
         {mode === 'feeds' && <FeedsView initialFeedId={readUrlState().feedId} />}
         {mode === 'bookmarks' && (<>
         <AddForm onSaved={refresh} />
@@ -764,7 +770,13 @@ function Sidebar({
   return (
     <aside className="sidebar" aria-label="Collections">
       <div className="sidebar-head">
-        <div className="sidebar-brand">Bookmarks</div>
+        <button
+          className="sidebar-brand"
+          onClick={() => onScopeChange({ kind: 'all' })}
+          title="Go to All bookmarks"
+        >
+          Bookmarks
+        </button>
         <button className="sidebar-btn" onClick={onToggle} title="Collapse sidebar">‹</button>
       </div>
 
@@ -861,6 +873,14 @@ function Sidebar({
           title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
         >
           {theme === 'light' ? '☾ Dark mode' : '☀ Light mode'}
+        </button>
+        <button
+          className={`sidebar-foot-icon${mode === 'settings' ? ' active' : ''}`}
+          onClick={() => onModeChange('settings')}
+          title="Settings"
+          aria-label="Settings"
+        >
+          ⚙
         </button>
       </div>
     </aside>
@@ -1123,6 +1143,243 @@ function buildPageList(current: number, total: number): (number | '…')[] {
     if (next !== undefined && next - curr > 1) out.push('…');
   }
   return out;
+}
+
+// App-level maintenance tools. Single scrolling page with titled sections —
+// no sub-nav until we reach 3+ sections (premature nav for one item is worse
+// than a plain scroll). Add future tools (bulk re-enrich, import cleanup,
+// backup export, cost dashboard…) as sibling <section>s below URL health.
+function SettingsView({ onArchived }: { onArchived: () => Promise<void> | void }) {
+  return (
+    <div className="settings-view">
+      <section className="settings-section">
+        <h2 className="settings-section-title">URL health</h2>
+        <DeadLinksView onArchived={onArchived} />
+      </section>
+    </div>
+  );
+}
+
+interface DeadCandidate {
+  id: number;
+  url: string;
+  title: string | null;
+  domain: string | null;
+  http_status: number;
+  last_checked_at: number | null;
+  created_at: number;
+}
+
+// URL-health scanner + dead-link review. Single page, two phases:
+//   1. Scan — loops POST /check-health?since=<startTs> until remaining=0.
+//      `since` is fixed at the start of the sweep so freshly-checked rows
+//      drop out of the candidate set immediately and the loop terminates.
+//   2. Review — lists 404/410 candidates with checkboxes; bulk-archives via
+//      POST /archive-bulk. Re-fetches the list after archive so the user
+//      can see what's left (or run another scan).
+function DeadLinksView({ onArchived }: { onArchived: () => Promise<void> | void }) {
+  const [candidates, setCandidates] = useState<DeadCandidate[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [scanning, setScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<{ checked: number; dead: number; remaining: number } | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [archiving, setArchiving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const stopRef = useRef(false);
+
+  const loadDead = useCallback(async () => {
+    try {
+      const r = await fetch('/api/bookmarks/dead');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = (await r.json()) as { bookmarks: DeadCandidate[] };
+      setCandidates(d.bookmarks ?? []);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void loadDead(); }, [loadDead]);
+
+  const runScan = async () => {
+    if (scanning) return;
+    stopRef.current = false;
+    setScanning(true);
+    setScanProgress({ checked: 0, dead: 0, remaining: 0 });
+    setError(null);
+    // Fix the sweep cursor at the moment the user clicked Scan. Any row
+    // probed during this sweep gets a last_checked_at >= startTs, so it
+    // disappears from the candidate query on the next batch — guaranteeing
+    // the loop terminates even if every probe completes instantly.
+    const startTs = Date.now();
+    let totalChecked = 0;
+    let totalDead = 0;
+    try {
+      while (!stopRef.current) {
+        const r = await fetch(`/api/bookmarks/check-health?since=${startTs}`, { method: 'POST' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = (await r.json()) as { checked: number; dead: number; remaining: number };
+        totalChecked += d.checked;
+        totalDead += d.dead;
+        setScanProgress({ checked: totalChecked, dead: totalDead, remaining: d.remaining });
+        if (d.checked === 0 || d.remaining === 0) break;
+      }
+      await loadDead();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const stopScan = () => { stopRef.current = true; };
+
+  const toggle = (id: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    if (selected.size === candidates.length) {
+      setSelected(new Set());
+    } else {
+      setSelected(new Set(candidates.map((c) => c.id)));
+    }
+  };
+
+  const archiveSelected = async () => {
+    if (!selected.size || archiving) return;
+    const ids = [...selected];
+    if (!confirm(`Archive ${ids.length} dead bookmark${ids.length === 1 ? '' : 's'}?`)) return;
+    setArchiving(true);
+    try {
+      const r = await fetch('/api/bookmarks/archive-bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setSelected(new Set());
+      await loadDead();
+      await onArchived();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setArchiving(false);
+    }
+  };
+
+  // Group by domain for the review list. Same domain appearing 12 times in
+  // the dead list often means the site changed its URL scheme rather than
+  // 12 separate articles being lost — useful signal before bulk-archiving.
+  const grouped = useMemo(() => {
+    const m = new Map<string, DeadCandidate[]>();
+    for (const c of candidates) {
+      const k = c.domain ?? '(unknown)';
+      const arr = m.get(k);
+      if (arr) arr.push(c); else m.set(k, [c]);
+    }
+    return [...m.entries()];
+  }, [candidates]);
+
+  return (
+    <div className="dead-links-view">
+      <div className="dead-links-intro">
+        <p>
+          Probes every non-archived bookmark with a HEAD request (falling back to GET).
+          Only <code>404</code> and <code>410</code> responses are flagged as dead — temporary
+          blips, paywalls, and bot-blocking 403s are recorded but not surfaced here.
+        </p>
+        <div className="dead-links-actions">
+          {scanning ? (
+            <button className="enrich-banner-btn" onClick={stopScan}>Stop scan</button>
+          ) : (
+            <button className="enrich-banner-btn" onClick={runScan}>Scan all bookmarks</button>
+          )}
+          {scanProgress && (
+            <span className="dead-links-progress">
+              Checked {scanProgress.checked.toLocaleString()} · {scanProgress.dead} dead found
+              {scanning && scanProgress.remaining > 0 && ` · ${scanProgress.remaining.toLocaleString()} remaining`}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {error && <div className="dead-links-error">Error: {error}</div>}
+
+      {loading ? (
+        <div className="dead-links-empty">Loading…</div>
+      ) : candidates.length === 0 ? (
+        <div className="dead-links-empty">
+          No dead links found{scanProgress ? ' in this scan.' : ' yet. Run a scan to check.'}
+        </div>
+      ) : (
+        <>
+          <div className="dead-links-toolbar">
+            <label className="dead-links-selectall">
+              <input
+                type="checkbox"
+                checked={selected.size > 0 && selected.size === candidates.length}
+                ref={(el) => {
+                  if (el) el.indeterminate = selected.size > 0 && selected.size < candidates.length;
+                }}
+                onChange={toggleAll}
+              />
+              {selected.size === candidates.length ? 'Deselect all' : 'Select all'}
+            </label>
+            <span className="dead-links-count">
+              {candidates.length} dead · {selected.size} selected
+            </span>
+            <button
+              className="enrich-banner-btn"
+              onClick={archiveSelected}
+              disabled={!selected.size || archiving}
+            >
+              {archiving ? 'Archiving…' : `Archive ${selected.size || ''}`}
+            </button>
+          </div>
+
+          <div className="dead-links-list">
+            {grouped.map(([domain, items]) => (
+              <div key={domain} className="dead-links-group">
+                <div className="dead-links-group-head">
+                  {domain} <span className="dead-links-group-count">({items.length})</span>
+                </div>
+                {items.map((c) => (
+                  <label key={c.id} className="dead-links-row">
+                    <input
+                      type="checkbox"
+                      checked={selected.has(c.id)}
+                      onChange={() => toggle(c.id)}
+                    />
+                    <div className="dead-links-row-body">
+                      <div className="dead-links-row-title">{c.title || c.url}</div>
+                      <a
+                        className="dead-links-row-url"
+                        href={c.url}
+                        target="_blank"
+                        rel="noreferrer noopener"
+                      >
+                        {c.url}
+                      </a>
+                    </div>
+                    <span className={`dead-links-status status-${c.http_status}`}>
+                      {c.http_status}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
 // Drains the 'imported' + 'pending' backlog in bounded batches. The server
