@@ -768,6 +768,7 @@ function Sidebar({
         <button className="sidebar-btn" onClick={onToggle} title="Collapse sidebar">‹</button>
       </div>
 
+      <div className="sidebar-body">
       <nav className="sidebar-nav">
         <button
           className={`sidebar-item${mode === 'bookmarks' && scope.kind === 'all' ? ' active' : ''}`}
@@ -851,6 +852,7 @@ function Sidebar({
         </div>
       )}
       {parseMsg && <div className="sidebar-hint">{parseMsg}</div>}
+      </div>
 
       <div className="sidebar-foot">
         <button
