@@ -295,7 +295,6 @@ body {
 .sidebar-foot {
   margin-top: auto;
   padding: 14px 4px 4px;
-  border-top: 1px solid var(--border);
 }
 
 .theme-toggle {
@@ -686,6 +685,23 @@ section h2 {
 }
 .category-select:focus,
 .category-input:focus { outline: none; border-color: var(--accent); color: var(--text); }
+
+.category-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.category-picker.is-saving .category-select {
+  opacity: 0.6;
+  cursor: progress;
+}
+.category-saving {
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+  margin-top: 6px;
+}
 
 .actions {
   position: absolute;

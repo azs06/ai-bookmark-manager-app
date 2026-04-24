@@ -236,6 +236,35 @@ export default function App() {
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [facets, setFacets] = useState<FacetsPayload>({ domains: [], years: [], contentTypes: [] });
 
+  // Guards against reload / close while an optimistic write is still in flight.
+  // The ref is authoritative (avoids setState-batching races); the boolean state
+  // exists only to drive the `beforeunload` effect below.
+  const pendingWrites = useRef(0);
+  const [hasPendingWrites, setHasPendingWrites] = useState(false);
+
+  const trackPending = useCallback(async <T,>(work: () => Promise<T>): Promise<T> => {
+    pendingWrites.current += 1;
+    setHasPendingWrites(true);
+    try {
+      return await work();
+    } finally {
+      pendingWrites.current -= 1;
+      if (pendingWrites.current === 0) setHasPendingWrites(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hasPendingWrites) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      // Modern browsers ignore custom messages and show their own generic dialog;
+      // preventDefault + setting returnValue is the cross-browser trigger.
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [hasPendingWrites]);
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem(THEME_KEY, theme);
@@ -400,18 +429,20 @@ export default function App() {
       list.map((b) => (b.id === id ? { ...b, ...patch } : b));
     setBookmarks(apply);
     setSearchResults((prev) => (prev ? apply(prev) : prev));
-    try {
-      const r = await fetch(`/api/bookmarks/${id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      if (patch.category_id !== undefined) void loadCategories();
-    } catch {
-      await refresh();
-    }
-  }, [refresh, loadCategories]);
+    await trackPending(async () => {
+      try {
+        const r = await fetch(`/api/bookmarks/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        if (patch.category_id !== undefined) void loadCategories();
+      } catch {
+        await refresh();
+      }
+    });
+  }, [refresh, loadCategories, trackPending]);
 
   // Video-only: flip watchedAt on/off. Optimistic update edits the raw
   // metadata JSON in state so the card re-renders dimmed immediately; a
@@ -427,30 +458,34 @@ export default function App() {
       });
     setBookmarks(mutate);
     setSearchResults((prev) => (prev ? mutate(prev) : prev));
-    try {
-      const r = await fetch(`/api/bookmarks/${id}/watched`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ watched }),
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    } catch {
-      await refresh();
-    }
-  }, [refresh]);
+    await trackPending(async () => {
+      try {
+        const r = await fetch(`/api/bookmarks/${id}/watched`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ watched }),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      } catch {
+        await refresh();
+      }
+    });
+  }, [refresh, trackPending]);
 
   const removeBookmark = useCallback(async (id: number) => {
     const drop = (list: Bookmark[]) => list.filter((b) => b.id !== id);
     setBookmarks(drop);
     setSearchResults((prev) => (prev ? drop(prev) : prev));
-    try {
-      const r = await fetch(`/api/bookmarks/${id}`, { method: 'DELETE' });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      void loadCategories();
-    } catch {
-      await refresh();
-    }
-  }, [refresh, loadCategories]);
+    await trackPending(async () => {
+      try {
+        const r = await fetch(`/api/bookmarks/${id}`, { method: 'DELETE' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        void loadCategories();
+      } catch {
+        await refresh();
+      }
+    });
+  }, [refresh, loadCategories, trackPending]);
 
   const tree = useMemo(() => buildTree(categoryRows), [categoryRows]);
   // Flat ordered list with paths, used by the per-card picker.
@@ -1351,29 +1386,44 @@ function BookmarkCard({
 
 function CategoryPicker({
   value, options, onChange,
-}: { value: number | null; options: CategoryNode[]; onChange: (next: number | null) => void }) {
+}: { value: number | null; options: CategoryNode[]; onChange: (next: number | null) => Promise<void> }) {
+  const [saving, setSaving] = useState(false);
+
+  const handleChange = async (next: number | null) => {
+    setSaving(true);
+    try {
+      await onChange(next);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
-    <select
-      className="category-select"
-      value={value === null ? 'none' : String(value)}
-      onChange={(e) => {
-        const v = e.target.value;
-        onChange(v === 'none' ? null : Number(v));
-      }}
-      title="Collection"
-    >
-      <option value="none">Uncategorized</option>
-      {options.map((o) => (
-        <option key={o.id} value={o.id}>
+    <div className={`category-picker${saving ? ' is-saving' : ''}`}>
+      <select
+        className="category-select"
+        value={value === null ? 'none' : String(value)}
+        onChange={(e) => {
+          const v = e.target.value;
+          void handleChange(v === 'none' ? null : Number(v));
+        }}
+        title="Collection"
+        disabled={saving}
+      >
+        <option value="none">Uncategorized</option>
+        {options.map((o) => (
+          <option key={o.id} value={o.id}>
           {' '.repeat(o.depth)}{o.name}
-        </option>
-      ))}
-      {/* Stale selection safety net: if the bookmark points at a category no longer in the list
-          (e.g. deleted by another tab before refresh), surface it so the select isn't blank. */}
-      {value !== null && !options.some((o) => o.id === value) && (
-        <option value={value}>(unknown #{value})</option>
-      )}
-    </select>
+          </option>
+        ))}
+        {/* Stale selection safety net: if the bookmark points at a category no longer in the list
+            (e.g. deleted by another tab before refresh), surface it so the select isn't blank. */}
+        {value !== null && !options.some((o) => o.id === value) && (
+          <option value={value}>(unknown #{value})</option>
+        )}
+      </select>
+      {saving && <span className="category-saving" aria-live="polite">Saving…</span>}
+    </div>
   );
 }
 
