@@ -529,6 +529,63 @@ body {
   cursor: pointer;
 }
 .enrich-banner-btn:hover { filter: brightness(0.95); }
+.enrich-banner-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  filter: none;
+}
+
+/* ─── Enrichment settings panel ───────────────────────────────────── */
+
+.enrichment-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.enrichment-panel-intro {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  font-size: 13px;
+  color: var(--muted-strong);
+}
+.enrichment-panel-intro p { margin: 0; line-height: 1.5; }
+.enrichment-panel-intro code {
+  font-size: 12px;
+  padding: 1px 5px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.enrichment-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.enrichment-panel-status {
+  font-size: 13px;
+  color: var(--muted);
+}
+.enrichment-panel-refresh {
+  padding: 6px 12px;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.enrichment-panel-refresh:hover { background: var(--surface); }
+.enrichment-panel-refresh:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
 
 /* ─── Filter bar ──────────────────────────────────────────────────── */
 
