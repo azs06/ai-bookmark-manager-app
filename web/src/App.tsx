@@ -557,8 +557,6 @@ export default function App() {
         {mode === 'bookmarks' && (<>
         <AddForm onSaved={refresh} />
 
-        <EnrichBanner onProgress={refresh} />
-
         <input
           type="search"
           className="search-input"
@@ -1147,11 +1145,15 @@ function buildPageList(current: number, total: number): (number | '…')[] {
 
 // App-level maintenance tools. Single scrolling page with titled sections —
 // no sub-nav until we reach 3+ sections (premature nav for one item is worse
-// than a plain scroll). Add future tools (bulk re-enrich, import cleanup,
-// backup export, cost dashboard…) as sibling <section>s below URL health.
+// than a plain scroll). Add future tools (import cleanup, backup export,
+// cost dashboard…) as sibling <section>s below the existing ones.
 function SettingsView({ onArchived }: { onArchived: () => Promise<void> | void }) {
   return (
     <div className="settings-view">
+      <section className="settings-section">
+        <h2 className="settings-section-title">Enrichment</h2>
+        <EnrichmentPanel onProgress={onArchived} />
+      </section>
       <section className="settings-section">
         <h2 className="settings-section-title">URL health</h2>
         <DeadLinksView onArchived={onArchived} />
@@ -1556,9 +1558,14 @@ function DeadLinksView({ onArchived }: { onArchived: () => Promise<void> | void 
 // processes each batch in background via waitUntil; we poll pending-count
 // between rounds so the UI shows actual server-observed progress, not a
 // hopeful counter based on what we queued.
-function EnrichBanner({ onProgress }: { onProgress: () => Promise<void> | void }) {
+//
+// Lives in Settings (not the landing page) — enrichment is an on-demand
+// maintenance action, not something the user should be nagged about every
+// time they open the app.
+function EnrichmentPanel({ onProgress }: { onProgress: () => Promise<void> | void }) {
   const [pending, setPending] = useState<number | null>(null);
   const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const stopRef = useRef(false);
 
   const fetchPending = useCallback(async () => {
@@ -1567,8 +1574,10 @@ function EnrichBanner({ onProgress }: { onProgress: () => Promise<void> | void }
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = (await r.json()) as { pending: number };
       setPending(d.pending);
-    } catch {
+      setError(null);
+    } catch (e) {
       setPending(null);
+      setError((e as Error).message);
     }
   }, []);
 
@@ -1578,6 +1587,7 @@ function EnrichBanner({ onProgress }: { onProgress: () => Promise<void> | void }
     if (running) return;
     stopRef.current = false;
     setRunning(true);
+    setError(null);
     try {
       // Loop: each round enriches up to 20, waits for the server to finish
       // (approx.), then checks the remaining count. Server backlog shrinking
@@ -1588,13 +1598,12 @@ function EnrichBanner({ onProgress }: { onProgress: () => Promise<void> | void }
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const d = (await r.json()) as { queued: number; remaining: number };
         if (d.queued === 0) break;
-        // Wait for the background batch to land, then refresh + re-poll.
         await new Promise((res) => setTimeout(res, 8000));
         await Promise.all([fetchPending(), Promise.resolve(onProgress())]);
         if (d.remaining === 0) break;
       }
-    } catch {
-      // Swallow — user can retry; pending count will refresh on next mount.
+    } catch (e) {
+      setError((e as Error).message);
     } finally {
       setRunning(false);
       await fetchPending();
@@ -1603,20 +1612,48 @@ function EnrichBanner({ onProgress }: { onProgress: () => Promise<void> | void }
 
   const stop = () => { stopRef.current = true; };
 
-  if (pending === null || pending === 0) return null;
+  const statusLine = (() => {
+    if (pending === null && error) return 'Status unavailable';
+    if (pending === null) return 'Loading status…';
+    if (running) return `Enriching… ${pending.toLocaleString()} remaining`;
+    if (pending === 0) return 'All bookmarks are enriched.';
+    return `${pending.toLocaleString()} bookmark${pending === 1 ? '' : 's'} waiting to be enriched`;
+  })();
+
+  const hasBacklog = pending !== null && pending > 0;
 
   return (
-    <div className="enrich-banner">
-      <span className="enrich-banner-label">
-        {running
-          ? `Enriching… ${pending.toLocaleString()} remaining`
-          : `${pending.toLocaleString()} bookmark${pending === 1 ? '' : 's'} waiting to be enriched`}
-      </span>
-      {running ? (
-        <button className="enrich-banner-btn" onClick={stop}>Stop</button>
-      ) : (
-        <button className="enrich-banner-btn" onClick={run}>Enrich all</button>
-      )}
+    <div className="enrichment-panel">
+      <div className="enrichment-panel-intro">
+        <p>
+          Imported bookmarks (from the Chrome extension or bulk import) and any
+          saves stuck on <code>pending</code> are processed here. Each pass
+          enriches up to 20 at a time — title, summary, tags, and embedding —
+          so you can stop and resume safely.
+        </p>
+        <div className="enrichment-panel-actions">
+          {running ? (
+            <button className="enrich-banner-btn" onClick={stop}>Stop</button>
+          ) : (
+            <button
+              className="enrich-banner-btn"
+              onClick={run}
+              disabled={!hasBacklog}
+            >
+              {hasBacklog ? 'Enrich all' : 'Nothing to enrich'}
+            </button>
+          )}
+          <button
+            className="enrichment-panel-refresh"
+            onClick={() => { void fetchPending(); }}
+            disabled={running}
+          >
+            Refresh status
+          </button>
+          <span className="enrichment-panel-status">{statusLine}</span>
+        </div>
+      </div>
+      {error && <div className="dead-links-error">Error: {error}</div>}
     </div>
   );
 }
