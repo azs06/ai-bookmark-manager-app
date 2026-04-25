@@ -474,6 +474,87 @@ app.get('/dead', async (c) => {
   return c.json({ bookmarks: rows.results ?? [] });
 });
 
+// Replace a bookmark's URL — used by the dead-links flow when a page moved
+// rather than disappeared (slug change on Medium, GitHub repo rename, etc.).
+// Touches identity columns (url, url_hash, domain) so it's a separate verb
+// from PATCH /:id, which only edits soft fields. Clears http_status so the
+// row drops out of the dead-links query immediately; status → 'pending' so
+// the UI shows "enriching" until re-enrichment finishes; metadata wiped so
+// stale YouTube/X JSON from the old URL doesn't render against the new one.
+app.post('/:id{[0-9]+}/url', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+
+  const body = await c.req.json<{ url?: string }>();
+  if (!body.url || typeof body.url !== 'string') {
+    return c.json({ error: 'url required' }, 400);
+  }
+
+  let normalized: string;
+  let domain: string;
+  try {
+    normalized = normalizeUrl(body.url);
+    domain = new URL(normalized).hostname;
+  } catch {
+    return c.json({ error: 'invalid url' }, 400);
+  }
+  const newHash = await hashUrl(normalized);
+
+  const current = await c.env.DB
+    .prepare('SELECT id, url_hash FROM bookmarks WHERE id = ?')
+    .bind(id)
+    .first<{ id: number; url_hash: string }>();
+  if (!current) return c.json({ error: 'not found' }, 404);
+
+  // No-op: same URL after normalization. Don't bother re-enriching.
+  if (current.url_hash === newHash) {
+    return c.json({ id, changed: false });
+  }
+
+  // Collision check covers archived rows too — url_hash is UNIQUE in the
+  // schema, so an archived ghost with the same hash would fail the UPDATE
+  // with a constraint error if we didn't catch it here first.
+  const collision = await c.env.DB
+    .prepare(`
+      SELECT id, url, title, status
+      FROM bookmarks
+      WHERE url_hash = ? AND id != ?
+    `)
+    .bind(newHash, id)
+    .first<{ id: number; url: string; title: string | null; status: BookmarkStatus }>();
+  if (collision) {
+    return c.json({
+      error: 'url already exists in library',
+      existing: collision,
+    }, 409);
+  }
+
+  const now = Date.now();
+  await c.env.DB
+    .prepare(`
+      UPDATE bookmarks
+      SET url             = ?,
+          url_hash        = ?,
+          domain          = ?,
+          http_status     = NULL,
+          last_checked_at = NULL,
+          status          = 'pending',
+          content_type    = NULL,
+          metadata        = '{}',
+          updated_at      = ?
+      WHERE id = ?
+    `)
+    .bind(normalized, newHash, domain, now, id)
+    .run();
+
+  // Re-enrichment refreshes title, og:image, summary, and tags against the
+  // new URL. The vector for the old URL is left in place — embedAndUpsert()
+  // inside enrich() overwrites the same id, so the index stays consistent.
+  c.executionCtx.waitUntil(enrich(c.env, id));
+
+  return c.json({ id, changed: true, url: normalized });
+});
+
 // Bulk soft-delete by id. Mirrors DELETE /:id semantics (status='archived' +
 // vector cleanup) so an archived-here bookmark behaves the same as one
 // archived from the card menu — including being restorable via re-save.
