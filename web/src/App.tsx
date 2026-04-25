@@ -1177,6 +1177,11 @@ interface DeadCandidate {
 //   2. Review — lists 404/410 candidates with checkboxes; bulk-archives via
 //      POST /archive-bulk. Re-fetches the list after archive so the user
 //      can see what's left (or run another scan).
+interface UrlConflict {
+  forId: number;
+  existing: { id: number; url: string; title: string | null; status: string };
+}
+
 function DeadLinksView({ onArchived }: { onArchived: () => Promise<void> | void }) {
   const [candidates, setCandidates] = useState<DeadCandidate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1185,6 +1190,13 @@ function DeadLinksView({ onArchived }: { onArchived: () => Promise<void> | void 
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [archiving, setArchiving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Single-row edit — only one URL editable at a time so the conflict block
+  // unambiguously belongs to one candidate.
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<UrlConflict | null>(null);
   const stopRef = useRef(false);
 
   const loadDead = useCallback(async () => {
@@ -1274,6 +1286,87 @@ function DeadLinksView({ onArchived }: { onArchived: () => Promise<void> | void 
     }
   };
 
+  const startEdit = (c: DeadCandidate) => {
+    setEditingId(c.id);
+    setEditValue(c.url);
+    setEditError(null);
+    setConflict(null);
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditValue('');
+    setEditError(null);
+    setConflict(null);
+  };
+
+  const saveEdit = async () => {
+    if (editingId === null || savingEdit) return;
+    const trimmed = editValue.trim();
+    if (!trimmed) { setEditError('URL required'); return; }
+    setSavingEdit(true);
+    setEditError(null);
+    setConflict(null);
+    try {
+      const r = await fetch(`/api/bookmarks/${editingId}/url`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: trimmed }),
+      });
+      if (r.status === 409) {
+        const d = (await r.json()) as { existing: UrlConflict['existing'] };
+        setConflict({ forId: editingId, existing: d.existing });
+        return;
+      }
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        throw new Error(d.error ?? `HTTP ${r.status}`);
+      }
+      // Optimistic removal — server cleared http_status, so the row no
+      // longer matches /api/bookmarks/dead. User re-scans later to verify.
+      setCandidates((prev) => prev.filter((b) => b.id !== editingId));
+      setSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(editingId);
+        return next;
+      });
+      cancelEdit();
+      void onArchived();
+    } catch (e) {
+      setEditError((e as Error).message);
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const resolveConflict = async (mode: 'keepExisting' | 'archiveBoth') => {
+    if (!conflict) return;
+    const ids = mode === 'archiveBoth'
+      ? [conflict.forId, conflict.existing.id]
+      : [conflict.forId];
+    setSavingEdit(true);
+    try {
+      const r = await fetch('/api/bookmarks/archive-bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setCandidates((prev) => prev.filter((b) => !ids.includes(b.id)));
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const id of ids) next.delete(id);
+        return next;
+      });
+      cancelEdit();
+      await onArchived();
+    } catch (e) {
+      setEditError((e as Error).message);
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
   // Group by domain for the review list. Same domain appearing 12 times in
   // the dead list often means the site changed its URL scheme rather than
   // 12 separate articles being lost — useful signal before bulk-archiving.
@@ -1350,29 +1443,106 @@ function DeadLinksView({ onArchived }: { onArchived: () => Promise<void> | void 
                 <div className="dead-links-group-head">
                   {domain} <span className="dead-links-group-count">({items.length})</span>
                 </div>
-                {items.map((c) => (
-                  <label key={c.id} className="dead-links-row">
-                    <input
-                      type="checkbox"
-                      checked={selected.has(c.id)}
-                      onChange={() => toggle(c.id)}
-                    />
-                    <div className="dead-links-row-body">
-                      <div className="dead-links-row-title">{c.title || c.url}</div>
-                      <a
-                        className="dead-links-row-url"
-                        href={c.url}
-                        target="_blank"
-                        rel="noreferrer noopener"
-                      >
-                        {c.url}
-                      </a>
+                {items.map((c) => {
+                  const isEditing = editingId === c.id;
+                  return (
+                    <div key={c.id} className={`dead-links-row${isEditing ? ' editing' : ''}`}>
+                      <input
+                        type="checkbox"
+                        checked={selected.has(c.id)}
+                        onChange={() => toggle(c.id)}
+                        disabled={isEditing}
+                        aria-label={`Select ${c.title || c.url}`}
+                      />
+                      <div className="dead-links-row-body">
+                        <div className="dead-links-row-title">{c.title || c.url}</div>
+                        {isEditing ? (
+                          <div className="dead-links-edit">
+                            <input
+                              type="url"
+                              className="dead-links-edit-input"
+                              value={editValue}
+                              onChange={(e) => setEditValue(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') { e.preventDefault(); void saveEdit(); }
+                                if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
+                              }}
+                              autoFocus
+                              disabled={savingEdit}
+                              placeholder="https://…"
+                            />
+                            <button
+                              className="dead-links-edit-save"
+                              onClick={() => void saveEdit()}
+                              disabled={savingEdit}
+                            >
+                              {savingEdit ? 'Saving…' : 'Save'}
+                            </button>
+                            <button
+                              className="dead-links-edit-cancel"
+                              onClick={cancelEdit}
+                              disabled={savingEdit}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <a
+                            className="dead-links-row-url"
+                            href={c.url}
+                            target="_blank"
+                            rel="noreferrer noopener"
+                          >
+                            {c.url}
+                          </a>
+                        )}
+                        {isEditing && editError && (
+                          <div className="dead-links-edit-error">{editError}</div>
+                        )}
+                        {isEditing && conflict && conflict.forId === c.id && (
+                          <div className="dead-links-conflict">
+                            <div className="dead-links-conflict-msg">
+                              This URL is already in your library
+                              {conflict.existing.status === 'archived' && ' (archived)'}
+                              :{' '}
+                              <strong>{conflict.existing.title || conflict.existing.url}</strong>
+                              {' '}(#{conflict.existing.id}).
+                            </div>
+                            <div className="dead-links-conflict-actions">
+                              <button
+                                className="dead-links-edit-save"
+                                onClick={() => void resolveConflict('keepExisting')}
+                                disabled={savingEdit}
+                              >
+                                Keep existing (archive this)
+                              </button>
+                              <button
+                                className="dead-links-edit-cancel"
+                                onClick={() => void resolveConflict('archiveBoth')}
+                                disabled={savingEdit}
+                              >
+                                Archive both
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <span className={`dead-links-status status-${c.http_status}`}>
+                        {c.http_status}
+                      </span>
+                      {!isEditing && (
+                        <button
+                          className="dead-links-edit-btn"
+                          onClick={() => startEdit(c)}
+                          title="Edit URL"
+                          aria-label="Edit URL"
+                        >
+                          ✎
+                        </button>
+                      )}
                     </div>
-                    <span className={`dead-links-status status-${c.http_status}`}>
-                      {c.http_status}
-                    </span>
-                  </label>
-                ))}
+                  );
+                })}
               </div>
             ))}
           </div>

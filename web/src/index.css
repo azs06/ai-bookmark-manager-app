@@ -1338,6 +1338,100 @@ section h2 {
   border: 1px solid var(--border);
 }
 
+.dead-links-row.editing { background: var(--surface-muted); }
+
+.dead-links-edit-btn {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted-strong);
+  font-size: 14px;
+  padding: 2px 10px;
+  border-radius: var(--r-md);
+  cursor: pointer;
+  line-height: 1.4;
+}
+.dead-links-edit-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.dead-links-edit {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+  margin-top: 2px;
+}
+.dead-links-edit-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+}
+.dead-links-edit-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.dead-links-edit-save {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  background: var(--accent);
+  color: var(--on-accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-md);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.dead-links-edit-save:hover { filter: brightness(0.95); }
+.dead-links-edit-save:disabled { opacity: 0.6; cursor: not-allowed; }
+.dead-links-edit-cancel {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  background: transparent;
+  color: var(--muted-strong);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.dead-links-edit-cancel:hover { border-color: var(--border-strong); color: var(--text); }
+.dead-links-edit-cancel:disabled { opacity: 0.6; cursor: not-allowed; }
+.dead-links-edit-error {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.dead-links-conflict {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--danger);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.dead-links-conflict-msg {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.45;
+}
+.dead-links-conflict-msg strong { color: var(--text); font-weight: 600; }
+.dead-links-conflict-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 /* ─── Responsive ─────────────────────────────────────────────────── */
 
 @media (max-width: 720px) {
