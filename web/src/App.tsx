@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 
 interface Bookmark {
   id: number;
@@ -84,7 +86,7 @@ interface CategoriesPayload {
 
 type View = 'list' | 'grid';
 type Theme = 'light' | 'dark';
-type Mode = 'bookmarks' | 'feeds' | 'settings';
+type Mode = 'bookmarks' | 'feeds' | 'settings' | 'reader';
 type Scope = { kind: 'all' } | { kind: 'uncategorized' } | { kind: 'category'; id: number };
 type Patch = Partial<Pick<Bookmark, 'importance' | 'note' | 'category_id'>>;
 type MinImportance = 0 | 1 | 2;
@@ -171,7 +173,7 @@ function buildTree(rows: CategoryRow[]): { roots: CategoryNode[]; byId: Map<numb
 //
 // Legacy read-only support: /?view=feeds[&feed_id=N] is still parsed so old
 // extension links and shared URLs keep working. We never write that shape.
-interface UrlState { mode: Mode; scope: Scope; feedId: number | null }
+interface UrlState { mode: Mode; scope: Scope; feedId: number | null; readerId: number | null }
 
 function parseCategoryParam(raw: string | null): Scope {
   if (raw === 'uncategorized') return { kind: 'uncategorized' };
@@ -180,21 +182,27 @@ function parseCategoryParam(raw: string | null): Scope {
   return { kind: 'all' };
 }
 
+const READER_PATH_RE = /^\/reader\/(\d+)\/?$/;
+
 function readUrlState(): UrlState {
   try {
     const path = window.location.pathname;
     const p = new URLSearchParams(window.location.search);
+    const readerMatch = path.match(READER_PATH_RE);
+    if (readerMatch) {
+      return { mode: 'reader', scope: { kind: 'all' }, feedId: null, readerId: Number(readerMatch[1]) };
+    }
     if (path === '/settings') {
-      return { mode: 'settings', scope: { kind: 'all' }, feedId: null };
+      return { mode: 'settings', scope: { kind: 'all' }, feedId: null, readerId: null };
     }
     if (path === '/feeds' || p.get('view') === 'feeds') {
       const raw = p.get('feed_id');
       const feedId = raw && Number.isFinite(Number(raw)) ? Number(raw) : null;
-      return { mode: 'feeds', scope: { kind: 'all' }, feedId };
+      return { mode: 'feeds', scope: { kind: 'all' }, feedId, readerId: null };
     }
-    return { mode: 'bookmarks', scope: parseCategoryParam(p.get('category')), feedId: null };
+    return { mode: 'bookmarks', scope: parseCategoryParam(p.get('category')), feedId: null, readerId: null };
   } catch {
-    return { mode: 'bookmarks', scope: { kind: 'all' }, feedId: null };
+    return { mode: 'bookmarks', scope: { kind: 'all' }, feedId: null, readerId: null };
   }
 }
 
@@ -215,6 +223,16 @@ function buildUrl(mode: Mode, scope: Scope): string {
 const INITIAL_URL_STATE = readUrlState();
 
 export default function App() {
+  // Reader is a self-contained, full-page view opened in a new tab. Short-
+  // circuit the rest of App (sidebar, bookmark list state, URL-sync effects)
+  // so it doesn't try to re-fetch the library or rewrite the URL away from
+  // /reader/:id. INITIAL_URL_STATE is read once at module load and never
+  // mutates — this branch is stable across renders, so hook order is
+  // preserved within each branch.
+  if (INITIAL_URL_STATE.mode === 'reader' && INITIAL_URL_STATE.readerId !== null) {
+    return <ReaderView bookmarkId={INITIAL_URL_STATE.readerId} />;
+  }
+
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [mode, setMode] = useState<Mode>(INITIAL_URL_STATE.mode);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
@@ -1739,6 +1757,256 @@ function BookmarkList({
   );
 }
 
+// Article-only: the markdown view targets readable prose, so we hide the
+// button for video and X posts (their content_type is set), and for rows
+// we haven't enriched yet (imported / pending / failed) — content_type is
+// only confirmed after enrich() runs, so showing the button beforehand
+// would be a guess.
+function isMarkdownEligible(b: Bookmark): boolean {
+  if (b.content_type === 'video' || b.content_type === 'x') return false;
+  return b.status === 'active' || b.status === 'partial';
+}
+
+type MarkdownSource = 'cf-markdown' | 'jina' | 'reddit';
+
+interface MarkdownResult {
+  ok: true;
+  markdown: string;
+  source: MarkdownSource | null;
+  cachedAt: number | null;
+  cached: boolean;
+}
+interface MarkdownFailure {
+  ok: false;
+  reason: 'unsupported' | 'fetch_failed' | 'ineligible_content_type' | 'network';
+  status?: number;
+  detail?: string;
+}
+
+interface ReaderBookmark {
+  id: number;
+  url: string;
+  title: string | null;
+  domain: string | null;
+}
+
+type ReaderViewMode = 'rendered' | 'source';
+type FetchState =
+  | { phase: 'loading' }
+  | { phase: 'refreshing'; previous: MarkdownResult }
+  | { phase: 'done'; result: MarkdownResult | MarkdownFailure };
+
+// Configure marked once. `gfm` enables tables/strikethrough/etc; `breaks: false`
+// keeps single newlines as soft breaks (CommonMark default), which matches what
+// most providers emit. `async: false` makes parse() return a string we can
+// hand to DOMPurify synchronously.
+marked.setOptions({ gfm: true, breaks: false, async: false });
+
+// Open every link in a new tab — readers usually want to skim references
+// without losing their place in the article. DOMPurify's ADD_ATTR config
+// keeps the target/rel attributes through sanitization.
+marked.use({
+  renderer: {
+    link({ href, title, tokens }) {
+      const text = (this as unknown as { parser: { parseInline(t: unknown): string } }).parser.parseInline(tokens);
+      const t = title ? ` title="${title.replace(/"/g, '&quot;')}"` : '';
+      return `<a href="${href}"${t} target="_blank" rel="noreferrer noopener">${text}</a>`;
+    },
+  },
+});
+
+function ReaderView({ bookmarkId }: { bookmarkId: number }) {
+  const [bookmark, setBookmark] = useState<ReaderBookmark | null>(null);
+  const [state, setState] = useState<FetchState>({ phase: 'loading' });
+  const [view, setView] = useState<ReaderViewMode>('rendered');
+
+  useEffect(() => {
+    document.title = 'Reader — AI Bookmarks';
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await fetch(`/api/bookmarks/${bookmarkId}`);
+        if (!r.ok) return;
+        const data = await r.json() as { bookmark: ReaderBookmark };
+        if (!cancelled && data.bookmark) {
+          setBookmark(data.bookmark);
+          if (data.bookmark.title) document.title = `${data.bookmark.title} — Reader`;
+        }
+      } catch {
+        // bookmark metadata is decorative; markdown fetch is the real payload
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [bookmarkId]);
+
+  const fetchMarkdown = useCallback(async (revalidate: boolean) => {
+    setState((prev) => {
+      if (revalidate && prev.phase === 'done' && prev.result.ok) {
+        return { phase: 'refreshing', previous: prev.result };
+      }
+      return { phase: 'loading' };
+    });
+    try {
+      const url = `/api/bookmarks/${bookmarkId}/markdown${revalidate ? '?revalidate=1' : ''}`;
+      const r = await fetch(url);
+      const data = await r.json() as MarkdownResult | MarkdownFailure;
+      setState({ phase: 'done', result: data });
+    } catch {
+      setState({ phase: 'done', result: { ok: false, reason: 'network' } });
+    }
+  }, [bookmarkId]);
+
+  useEffect(() => { void fetchMarkdown(false); }, [fetchMarkdown]);
+
+  // Memoized render: parse + sanitize once per markdown payload, not per
+  // render. DOMPurify strips <script>, <iframe>, on* handlers, etc — the
+  // worker fetches arbitrary external pages, so the markdown can contain
+  // anything and we don't trust it.
+  const visible: MarkdownResult | MarkdownFailure | null =
+    state.phase === 'refreshing' ? state.previous :
+    state.phase === 'done' ? state.result :
+    null;
+  const isLoading = state.phase === 'loading' || state.phase === 'refreshing';
+  const renderedHtml = useMemo(() => {
+    if (!visible || !visible.ok) return '';
+    const cleaned = stripFrontmatter(visible.markdown);
+    const raw = marked.parse(cleaned) as string;
+    return DOMPurify.sanitize(raw, { ADD_ATTR: ['target', 'rel'] });
+  }, [visible]);
+
+  return (
+    <div className="reader-shell">
+      <header className="reader-header">
+        <div className="reader-title-block">
+          <div className="reader-title">
+            {bookmark?.title ?? (state.phase === 'loading' ? 'Loading…' : 'Reader')}
+          </div>
+          <div className="reader-sub">
+            {bookmark && (
+              <a href={bookmark.url} target="_blank" rel="noreferrer" className="reader-source-link">
+                {bookmark.domain ?? bookmark.url}
+              </a>
+            )}
+            {visible && visible.ok && (
+              <>
+                <span className="reader-dot">·</span>
+                <span>{sourceLabel(visible.source)}</span>
+                {visible.cachedAt != null && (
+                  <>
+                    <span className="reader-dot">·</span>
+                    <span>
+                      {state.phase === 'refreshing' ? 'Refreshing — cached ' : 'Cached '}
+                      {formatRelativeTime(visible.cachedAt)}
+                    </span>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+        <div className="reader-actions">
+          <div className="reader-toggle" role="tablist" aria-label="View mode">
+            <button
+              role="tab"
+              aria-selected={view === 'rendered'}
+              className={`reader-toggle-btn${view === 'rendered' ? ' active' : ''}`}
+              onClick={() => setView('rendered')}
+            >
+              Rendered
+            </button>
+            <button
+              role="tab"
+              aria-selected={view === 'source'}
+              className={`reader-toggle-btn${view === 'source' ? ' active' : ''}`}
+              onClick={() => setView('source')}
+            >
+              Source
+            </button>
+          </div>
+          <button
+            className="reader-icon-btn"
+            onClick={() => fetchMarkdown(true)}
+            disabled={isLoading || !visible || !visible.ok}
+            title="Refresh: re-fetch and update cache"
+          >
+            {isLoading ? '…' : '↻'}
+          </button>
+          <button
+            className="reader-icon-btn"
+            onClick={() => window.close()}
+            title="Close tab"
+          >
+            ✕
+          </button>
+        </div>
+      </header>
+
+      <main className="reader-main">
+        {state.phase === 'loading' && <div className="reader-empty">Fetching markdown…</div>}
+        {visible && visible.ok && view === 'rendered' && (
+          <article className="reader-article">
+            <div className="reader-prose" dangerouslySetInnerHTML={{ __html: renderedHtml }} />
+          </article>
+        )}
+        {visible && visible.ok && view === 'source' && (
+          <pre className="reader-source">{visible.markdown}</pre>
+        )}
+        {state.phase === 'done' && !state.result.ok && (
+          <div className="reader-empty reader-error">{markdownErrorMessage(state.result)}</div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+// Markdown for Agents and Jina Reader both prepend YAML frontmatter (--- ...
+// ---) describing the page. That metadata is duplicated in our header (title,
+// domain, source) so showing it inside the article body is just visual noise.
+// Also strip Jina's "Title:/URL Source:/Published Time:/Markdown Content:"
+// header block that comes before the actual content.
+function stripFrontmatter(md: string): string {
+  let out = md.replace(/^\s*---\r?\n[\s\S]*?\r?\n---\r?\n+/, '');
+  out = out.replace(/^(?:Title:.*\r?\n|URL Source:.*\r?\n|Published Time:.*\r?\n|Markdown Content:\s*\r?\n|\r?\n)+/i, '');
+  return out;
+}
+
+function sourceLabel(source: MarkdownSource | null): string {
+  if (source === 'cf-markdown') return 'via Cloudflare Markdown for Agents';
+  if (source === 'jina') return 'via Jina Reader';
+  if (source === 'reddit') return 'via Reddit API';
+  return 'via unknown source';
+}
+
+function formatRelativeTime(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 0) return 'just now';
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  return new Date(ts).toLocaleDateString();
+}
+
+function markdownErrorMessage(f: MarkdownFailure): string {
+  switch (f.reason) {
+    case 'unsupported':
+      return `Couldn't get markdown for this URL.`;
+    case 'fetch_failed':
+      return `Could not reach the page${f.status ? ` (HTTP ${f.status})` : ''}.`;
+    case 'ineligible_content_type':
+      return `Markdown view isn't available for this content type.`;
+    case 'network':
+      return `Network error fetching markdown.`;
+  }
+}
+
 function BookmarkCard({
   b, categories, onReenriched, onUpdate, onDelete, onToggleWatched,
 }: { b: Bookmark } & CardHandlers) {
@@ -1776,6 +2044,8 @@ function BookmarkCard({
   const videoClass = isVideo ? ' is-video' : '';
   const xPostClass = isXPost ? ' is-x-post' : '';
   const watchedClass = isWatched ? ' watched' : '';
+
+  const showMarkdownButton = isMarkdownEligible(b);
 
   return (
     <div className={`bookmark${pinnedClass}${videoClass}${xPostClass}${watchedClass}`}>
@@ -1829,6 +2099,31 @@ function BookmarkCard({
           >
             {isWatched ? '✓' : '◯'}
           </button>
+        )}
+        {showMarkdownButton && (
+          <a
+            className="icon-btn markdown-btn"
+            href={`/reader/${b.id}`}
+            target="_blank"
+            rel="noreferrer"
+            title="Preview as markdown (opens in new tab)"
+            aria-label="Preview as markdown"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width="15"
+              height="15"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+              <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
+            </svg>
+          </a>
         )}
         <button
           className="icon-btn reenrich-btn"

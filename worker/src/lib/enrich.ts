@@ -5,6 +5,7 @@ import { embedAndUpsert } from './vector';
 import type { SummarizeInput, SummaryResult } from './prompts';
 import { detectYouTube, fetchTranscript, fetchYouTubeMetadata } from './youtube';
 import { detectX, fetchXPostData, type XHit } from './x';
+import { detectReddit, fetchRedditPost, type RedditHit } from './reddit';
 
 const USER_AGENT = 'Mozilla/5.0 (compatible; AIBookmarks/0.1)';
 const FETCH_TIMEOUT_MS = 8000;
@@ -111,6 +112,13 @@ async function extractForEnrichment(url: string): Promise<EnrichmentExtract> {
   if (x) return extractXPost(x);
   const yt = detectYouTube(url);
   if (yt) return extractYouTube(yt.videoId);
+  const reddit = detectReddit(url);
+  if (reddit) {
+    const r = await extractRedditPost(reddit);
+    if (r) return r;
+    // .json failed (deleted post, rate limit, etc.) — fall through to the
+    // article path so the user still gets *something* rather than nothing.
+  }
   return extractArticle(url);
 }
 
@@ -175,6 +183,55 @@ async function extractYouTube(videoId: string): Promise<EnrichmentExtract> {
     metadata,
     summarizeInput,
     videoContext: { channel: meta.channel, durationSec: meta.durationSec },
+  };
+}
+
+// Reddit branch: bypass the JS bot wall by hitting the public .json endpoint.
+// Title gets the post title; excerpt is selftext (for self-posts) followed by
+// the top 3 comments so the AI summary has community signal, not just the OP.
+// content_type stays null — Reddit posts behave like articles in the UI; the
+// reddit-specific fields (score, comments, subreddit) live in metadata for
+// future filtering. Returns null on any failure so the caller can fall back.
+async function extractRedditPost(hit: RedditHit): Promise<EnrichmentExtract | null> {
+  const data = await fetchRedditPost(hit);
+  if (!data) return null;
+
+  const subPrefix = data.subreddit ? `r/${data.subreddit} · ` : '';
+  const title = `${subPrefix}${data.title}`;
+
+  const parts: string[] = [];
+  if (data.selftext) parts.push(data.selftext.trim());
+  for (const c of data.topComments) {
+    const body = c.body.length > 400 ? `${c.body.slice(0, 400)}…` : c.body;
+    parts.push(`> u/${c.author} (${c.score}): ${body}`);
+  }
+  const excerpt = parts.join('\n\n').slice(0, MAX_EXCERPT_CHARS) || null;
+
+  // Description is the first ~240 chars of selftext, or a comment-count blurb
+  // for link/image posts so the card body has something to render.
+  const ogDescription = data.selftext
+    ? data.selftext.slice(0, 240)
+    : `${data.numComments ?? 0} comments · ${data.score ?? 0} points`;
+
+  return {
+    title,
+    ogImage: data.thumbnail,
+    ogDescription,
+    excerpt,
+    contentType: null,
+    metadata: {
+      reddit: {
+        subreddit: data.subreddit,
+        author: data.author,
+        score: data.score,
+        numComments: data.numComments,
+        postedAt: data.postedAt,
+        linkUrl: data.linkUrl,
+      },
+    },
+    summarizeInput: excerpt
+      ? { title: data.title, excerpt }
+      : null,
   };
 }
 

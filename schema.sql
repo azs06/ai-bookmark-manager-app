@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS bookmarks (
   metadata        TEXT    NOT NULL DEFAULT '{}',       -- JSON bag for type-specific fields
   http_status     INTEGER,                             -- last URL probe result (404/410 = dead)
   last_checked_at INTEGER,                             -- when the URL was last probed
+  markdown_cached    TEXT,                             -- last fetched markdown (View as Markdown)
+  markdown_cached_at INTEGER,                          -- when the cache was populated
+  markdown_source    TEXT,                             -- 'cf-markdown' | 'jina' | 'reddit'
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL
 );
