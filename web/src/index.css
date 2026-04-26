@@ -828,6 +828,7 @@ section h2 {
   justify-content: center;
   padding: 0;
   opacity: 0;
+  text-decoration: none;
   transition: opacity 0.15s, border-color 0.12s, color 0.12s;
 }
 .bookmark:hover .icon-btn,
@@ -852,6 +853,15 @@ section h2 {
   border-color: var(--danger);
   color: var(--danger);
 }
+
+/* Hover-revealed like the other card actions — only the SVG-specific tweaks
+   live here. The book-open glyph inherits currentColor from .icon-btn. */
+.markdown-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.markdown-btn svg { display: block; }
 
 .watched-btn.watched {
   color: var(--accent);
@@ -1504,4 +1514,297 @@ section h2 {
   }
   .app-shell.sidebar-collapsed .sidebar { display: none; }
   .app-main { padding: 16px 16px 80px; }
+}
+
+/* Reader page — dedicated full-page reading view opened in a new tab from
+   the ⌘ button. Layout: sticky workbench-toned header on a paper-tone
+   background, with a central article surface that breathes. */
+.reader-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: var(--surface-muted);
+  color: var(--text);
+}
+
+/* Sticky chrome. Keep it slim so most of the viewport is content. The thin
+   border + barely-there shadow separates it from the article without making
+   the page feel "appy". */
+.reader-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 12px 28px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.reader-title-block { flex: 1; min-width: 0; }
+.reader-title {
+  font-family: var(--font-display);
+  letter-spacing: var(--title-tracking);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.reader-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  letter-spacing: -0.01em;
+}
+.reader-source-link { color: var(--muted-strong); text-decoration: none; }
+.reader-source-link:hover { color: var(--accent); }
+.reader-dot { color: var(--border-strong); user-select: none; }
+.reader-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+
+.reader-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--bg);
+}
+.reader-toggle-btn {
+  font: 11px/1 var(--font-display);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  padding: 7px 14px;
+  cursor: pointer;
+  transition: color 0.12s, background-color 0.12s;
+}
+.reader-toggle-btn:hover { color: var(--text); }
+.reader-toggle-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.reader-icon-btn {
+  width: 30px;
+  height: 30px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 0.12s, color 0.12s;
+}
+.reader-icon-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.reader-icon-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Article surface — a card on the muted page background. Generous side
+   padding so text never butts against the edge on narrow viewports. The
+   subtle border + flat fill keeps the workbench aesthetic; no drop shadow. */
+.reader-main {
+  flex: 1;
+  width: 100%;
+  max-width: 740px;
+  margin: 32px auto 80px;
+  padding: 0 24px;
+}
+.reader-article {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 56px 64px;
+}
+.reader-empty {
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+  padding: 80px 0;
+  font-family: var(--font-mono);
+}
+.reader-error { color: var(--danger); }
+
+/* Source view — raw markdown, monospaced, in the same card surface so the
+   toggle feels like switching the lens, not the page. */
+.reader-source {
+  font: 13px/1.6 var(--font-mono);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 32px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Prose. Tuned for long-form reading: 17px body, generous leading, ~70ch
+   measure, headings stepped from a serif-feel display font. Long URLs wrap
+   instead of forcing horizontal scroll. */
+.reader-prose {
+  font: 17px/1.7 var(--font-body);
+  color: var(--text);
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+.reader-prose > *:first-child { margin-top: 0; }
+.reader-prose > *:last-child { margin-bottom: 0; }
+
+.reader-prose h1,
+.reader-prose h2,
+.reader-prose h3,
+.reader-prose h4 {
+  font-family: var(--font-display);
+  letter-spacing: var(--title-tracking);
+  color: var(--text);
+  line-height: 1.25;
+  font-weight: 600;
+}
+.reader-prose h1 {
+  font-size: 1.85em;
+  margin: 0 0 0.6em;
+  letter-spacing: -0.025em;
+}
+.reader-prose h2 {
+  font-size: 1.35em;
+  margin: 1.8em 0 0.6em;
+  padding-top: 0.4em;
+  border-top: 1px solid var(--border);
+}
+.reader-prose h2:first-child { border-top: 0; padding-top: 0; }
+.reader-prose h3 {
+  font-size: 1.12em;
+  margin: 1.6em 0 0.4em;
+  color: var(--muted-strong);
+}
+.reader-prose h4 {
+  font-size: 0.92em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 1.4em 0 0.4em;
+}
+
+.reader-prose p { margin: 0 0 1.05em; }
+.reader-prose strong { font-weight: 600; color: var(--text); }
+.reader-prose em { font-style: italic; }
+
+.reader-prose a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+  transition: text-decoration-color 0.12s;
+}
+.reader-prose a:hover { text-decoration-color: var(--accent); }
+
+.reader-prose ul,
+.reader-prose ol { margin: 0.4em 0 1.2em; padding-left: 1.4em; }
+.reader-prose li { margin: 0.35em 0; }
+.reader-prose li > p { margin: 0.3em 0; }
+
+.reader-prose blockquote {
+  margin: 1.4em 0;
+  padding: 0.6em 1.2em;
+  border-left: 3px solid var(--accent);
+  color: var(--muted-strong);
+  background: var(--surface-muted);
+  border-radius: 0 var(--r-md) var(--r-md) 0;
+  font-style: italic;
+}
+.reader-prose blockquote > *:last-child { margin-bottom: 0; }
+
+.reader-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  padding: 0.1em 0.4em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.reader-prose pre {
+  font: 13.5px/1.6 var(--font-mono);
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 16px 18px;
+  overflow-x: auto;
+  margin: 1.2em 0;
+}
+.reader-prose pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+  white-space: pre;
+}
+
+/* Images — constrained, centered, with a subtle border so they sit cleanly
+   on the card surface. Inside lists (e.g. author thumbnails), much smaller
+   and inline so author bylines don't blow up the layout. */
+.reader-prose img {
+  display: block;
+  max-width: 100%;
+  max-height: 520px;
+  height: auto;
+  margin: 1.4em auto;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+}
+.reader-prose li img {
+  display: inline-block;
+  max-height: 32px;
+  max-width: 32px;
+  margin: 0 0.4em -0.3em 0;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+
+.reader-prose hr { border: 0; border-top: 1px solid var(--border); margin: 2.4em 0; }
+
+.reader-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.4em 0;
+  font-size: 0.95em;
+}
+.reader-prose th,
+.reader-prose td {
+  border: 1px solid var(--border);
+  padding: 0.55em 0.85em;
+  text-align: left;
+  vertical-align: top;
+}
+.reader-prose th {
+  background: var(--surface-muted);
+  font-weight: 600;
+  font-family: var(--font-display);
+  letter-spacing: var(--title-tracking);
+}
+
+/* Narrow viewports — drop the side padding on the card so it fills the page,
+   slightly tighter line height, smaller body. */
+@media (max-width: 720px) {
+  .reader-header { padding: 10px 16px; gap: 12px; }
+  .reader-toggle-btn { padding: 6px 10px; }
+  .reader-main { margin: 16px auto 60px; padding: 0 12px; }
+  .reader-article { padding: 28px 22px; border-radius: var(--r-md); }
+  .reader-prose { font-size: 16px; line-height: 1.65; }
+  .reader-prose h1 { font-size: 1.55em; }
+  .reader-prose h2 { font-size: 1.2em; }
 }

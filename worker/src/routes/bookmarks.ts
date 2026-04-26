@@ -5,6 +5,7 @@ import { enrich } from '../lib/enrich';
 import { deleteEmbedding, embedAndUpsert } from '../lib/vector';
 import { detectYouTube } from '../lib/youtube';
 import { detectX } from '../lib/x';
+import { detectReddit, fetchRedditPost, type RedditPostData } from '../lib/reddit';
 import { probeUrl } from '../lib/health';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -306,6 +307,136 @@ app.post('/:id/re-enrich', async (c) => {
   return c.json({ ok: true, id, queued: true });
 });
 
+// Fetches a markdown rendering of the bookmark's URL. Cache-first: a hit
+// returns immediately. On miss (or ?revalidate=1) we try Cloudflare's
+// "Markdown for Agents" content negotiation first — instant and zero cost
+// when the origin opted in — then fall back to Jina Reader (r.jina.ai/<url>)
+// which works on arbitrary URLs. Skipped for video/X content; those have
+// dedicated metadata flows.
+type MarkdownSource = 'cf-markdown' | 'jina' | 'reddit';
+
+const JINA_READER_PREFIX = 'https://r.jina.ai/';
+const MD_USER_AGENT = 'ai-bookmark-manager (+markdown-for-agents)';
+
+interface MarkdownRow {
+  url: string;
+  content_type: string | null;
+  markdown_cached: string | null;
+  markdown_cached_at: number | null;
+  markdown_source: string | null;
+}
+
+app.get('/:id{[0-9]+}/markdown', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+
+  const revalidate = c.req.query('revalidate') === '1';
+
+  const row = await c.env.DB
+    .prepare(`
+      SELECT url, content_type, markdown_cached, markdown_cached_at, markdown_source
+      FROM bookmarks WHERE id = ?
+    `)
+    .bind(id)
+    .first<MarkdownRow>();
+  if (!row) return c.json({ error: 'not found' }, 404);
+  if (row.content_type === 'video' || row.content_type === 'x') {
+    return c.json({ ok: false, reason: 'ineligible_content_type', contentType: row.content_type }, 400);
+  }
+
+  if (!revalidate && row.markdown_cached) {
+    return c.json({
+      ok: true,
+      markdown: row.markdown_cached,
+      source: row.markdown_source as MarkdownSource | null,
+      cachedAt: row.markdown_cached_at,
+      cached: true,
+    });
+  }
+
+  const result = await fetchMarkdown(row.url);
+  if (!result.ok) return c.json(result, result.status === 502 ? 502 : 200);
+
+  const now = Date.now();
+  await c.env.DB
+    .prepare(`
+      UPDATE bookmarks
+      SET markdown_cached = ?, markdown_cached_at = ?, markdown_source = ?, updated_at = ?
+      WHERE id = ?
+    `)
+    .bind(result.markdown, now, result.source, now, id)
+    .run();
+
+  return c.json({
+    ok: true,
+    markdown: result.markdown,
+    source: result.source,
+    cachedAt: now,
+    cached: false,
+  });
+});
+
+interface MarkdownFetchOk {
+  ok: true;
+  markdown: string;
+  source: MarkdownSource;
+}
+interface MarkdownFetchFail {
+  ok: false;
+  reason: 'unsupported' | 'fetch_failed';
+  status?: number;
+  detail?: string;
+}
+
+// Three-stage lookup. Reddit goes first because the modern reddit.com
+// gates scrapers behind a JS bot wall — both content negotiation and Jina
+// return near-empty results. The .json endpoint sidesteps that. For everything
+// else: try Cloudflare Markdown for Agents on the origin (free, instant, but
+// opt-in by zone); on miss, fall back to Jina Reader which extracts readable
+// markdown from arbitrary URLs anonymously.
+async function fetchMarkdown(url: string): Promise<MarkdownFetchOk | MarkdownFetchFail> {
+  // Stage 0 (Reddit-only): hit the .json endpoint and format as markdown.
+  const redditHit = detectReddit(url);
+  if (redditHit) {
+    const data = await fetchRedditPost(redditHit);
+    if (data) {
+      return { ok: true, markdown: formatRedditMarkdown(data), source: 'reddit' };
+    }
+    // .json failed — fall through to the generic stages.
+  }
+
+  // Stage 1: content-negotiate against the origin.
+  try {
+    const r = await fetch(url, {
+      headers: { Accept: 'text/markdown, text/html;q=0.1', 'User-Agent': MD_USER_AGENT },
+      redirect: 'follow',
+    });
+    if (r.ok) {
+      const ct = (r.headers.get('content-type') ?? '').toLowerCase();
+      if (ct.startsWith('text/markdown')) {
+        return { ok: true, markdown: await r.text(), source: 'cf-markdown' };
+      }
+    }
+  } catch {
+    // fall through to Jina
+  }
+
+  // Stage 2: Jina Reader. Anonymous use is rate-limited (~20 req/min); a
+  // future JINA_API_KEY env var can lift that — header is x-api-key.
+  try {
+    const r = await fetch(JINA_READER_PREFIX + url, {
+      headers: { Accept: 'text/markdown', 'User-Agent': MD_USER_AGENT },
+      redirect: 'follow',
+    });
+    if (!r.ok) {
+      return { ok: false, reason: 'fetch_failed', status: r.status, detail: 'jina' };
+    }
+    return { ok: true, markdown: await r.text(), source: 'jina' };
+  } catch (err) {
+    return { ok: false, reason: 'fetch_failed', detail: (err as Error).message };
+  }
+}
+
 // Marks a video as watched / unwatched. Stored as a timestamp in
 // metadata.watchedAt so the UI can later surface "watched this week" etc.
 // Scoped to content_type='video' — trying to mark an article as watched is
@@ -571,6 +702,9 @@ app.post('/:id{[0-9]+}/url', async (c) => {
           status          = 'pending',
           content_type    = NULL,
           metadata        = '{}',
+          markdown_cached    = NULL,
+          markdown_cached_at = NULL,
+          markdown_source    = NULL,
           updated_at      = ?
       WHERE id = ?
     `)
@@ -771,6 +905,54 @@ async function repairRestoredBookmark(env: Env, row: ExistingBookmark): Promise<
   }
 
   await enrich(env, row.id);
+}
+
+// Reddit JSON → markdown. We render the post (title, OP, body) and the top
+// comments as a blockquote thread so the reader sees discussion context, not
+// just the OP — which is usually what makes a Reddit link worth saving.
+function formatRedditMarkdown(d: RedditPostData): string {
+  const lines: string[] = [];
+  lines.push(`# ${d.title}`);
+  lines.push('');
+  const meta: string[] = [];
+  if (d.subreddit) meta.push(`r/${d.subreddit}`);
+  if (d.author) meta.push(`by u/${d.author}`);
+  if (d.score != null) meta.push(`${d.score} points`);
+  if (d.numComments != null) meta.push(`${d.numComments} comments`);
+  if (d.postedAt) meta.push(new Date(d.postedAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }));
+  if (meta.length) lines.push(`*${meta.join(' · ')}*`);
+  lines.push('');
+
+  if (d.linkUrl) {
+    lines.push(`**Linked:** ${d.linkUrl}`);
+    lines.push('');
+  }
+  if (d.thumbnail) {
+    lines.push(`![](${d.thumbnail})`);
+    lines.push('');
+  }
+  if (d.selftext) {
+    lines.push(d.selftext.trim());
+    lines.push('');
+  }
+
+  if (d.topComments.length) {
+    lines.push('---');
+    lines.push('');
+    lines.push('## Top comments');
+    lines.push('');
+    for (const c of d.topComments) {
+      lines.push(`**u/${c.author}** · ${c.score} points`);
+      lines.push('');
+      // Indent the comment body as a blockquote so it visually nests under
+      // the author line.
+      const body = c.body.split('\n').map((l) => `> ${l}`).join('\n');
+      lines.push(body);
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n');
 }
 
 export default app;
