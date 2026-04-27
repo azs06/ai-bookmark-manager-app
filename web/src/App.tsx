@@ -121,6 +121,7 @@ const PAGE_SIZE = 25;
 const THEME_KEY = 'bm:theme';
 const SIDEBAR_KEY = 'bm:sidebar-open';
 const EXPANDED_KEY = 'bm:expanded-cats';
+const PICKS_COLLAPSED_KEY = 'bm:picks-collapsed';
 
 function initialTheme(): Theme {
   const saved = localStorage.getItem(THEME_KEY);
@@ -597,7 +598,7 @@ export default function App() {
         {loading && <p className="empty">Loading…</p>}
         {error && <p className="empty">Error: {error}</p>}
 
-        {searchResults === null && !loading && !error && scope.kind === 'all' && page === 0 && (
+        {searchResults === null && !loading && !error && scope.kind === 'all' && page === 0 && !isFilterActive(filters) && (
           <TodaysPicks
             view={view}
             categories={flatCategories}
@@ -2267,12 +2268,78 @@ function NoteField({
 
 interface PickEnvelope { reason: string; bookmark: Bookmark; }
 
+// Dev-only fixtures. Referenced from TodaysPicks.fetchPicks behind a
+// import.meta.env.DEV guard, so this whole block is dead-code-eliminated in
+// production builds. Delete once seeded local data is reliable.
+const DUMMY_PICKS: PickEnvelope[] = [
+  {
+    reason: 'You bookmarked three React 19 deep-dives this month — this one ties them together.',
+    bookmark: {
+      id: -1001,
+      url: 'https://overreacted.io/before-you-memo/',
+      title: 'Before You memo() — Dan Abramov',
+      note: '',
+      domain: 'overreacted.io',
+      ai_summary: 'Two patterns to avoid wrapping everything in React.memo: lift state up, or move expensive children below the state.',
+      ai_tags: 'react,performance,memo',
+      category_id: null,
+      og_image_url: null,
+      importance: 4,
+      status: 'active',
+      content_type: 'article',
+      metadata: '{}',
+      created_at: Date.now() - 1000 * 60 * 60 * 6,
+    },
+  },
+  {
+    reason: "Matches your recent reading on edge databases — and you haven't watched a video in a while.",
+    bookmark: {
+      id: -1002,
+      url: 'https://www.youtube.com/watch?v=dummyvideo',
+      title: 'How Cloudflare D1 actually works under the hood',
+      note: '',
+      domain: 'youtube.com',
+      ai_summary: 'Walks through D1 internals: SQLite at the edge, replication via leader-followers, and the read/write split.',
+      ai_tags: 'cloudflare,d1,sqlite,databases',
+      category_id: null,
+      og_image_url: null,
+      importance: 3,
+      status: 'active',
+      content_type: 'video',
+      metadata: JSON.stringify({ channel: 'Cloudflare', durationSec: 1342 }),
+      created_at: Date.now() - 1000 * 60 * 60 * 24 * 2,
+    },
+  },
+  {
+    reason: 'Saved 3 weeks ago, never opened — short read worth catching up on.',
+    bookmark: {
+      id: -1003,
+      url: 'https://martinfowler.com/articles/feature-toggles.html',
+      title: 'Feature Toggles (aka Feature Flags) — Martin Fowler',
+      note: 'For the auth refactor.',
+      domain: 'martinfowler.com',
+      ai_summary: 'Categorises flags into release / experiment / ops / permission toggles, and explains how lifetime + dynamism shape the implementation.',
+      ai_tags: 'feature-flags,deployment,architecture',
+      category_id: null,
+      og_image_url: null,
+      importance: 5,
+      status: 'active',
+      content_type: 'article',
+      metadata: '{}',
+      created_at: Date.now() - 1000 * 60 * 60 * 24 * 21,
+    },
+  },
+];
+
 function TodaysPicks({
   view, ...handlers
 }: { view: View } & CardHandlers) {
   const [picks, setPicks] = useState<PickEnvelope[] | null>(null);
   const [date, setDate] = useState<string>('');
   const [refreshing, setRefreshing] = useState(false);
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    return localStorage.getItem(PICKS_COLLAPSED_KEY) === '1';
+  });
 
   const fetchPicks = useCallback(async () => {
     try {
@@ -2280,13 +2347,34 @@ function TodaysPicks({
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = (await r.json()) as { date: string; picks: PickEnvelope[] };
       setDate(d.date);
-      setPicks(d.picks ?? []);
+      const picks = d.picks ?? [];
+      // Dev-only fallback: render dummy picks when the local DB has none, so
+      // the section is visible while iterating on UI. Stripped from prod by Vite.
+      if (import.meta.env.DEV && picks.length === 0) {
+        setDate(d.date || new Date().toISOString().slice(0, 10));
+        setPicks(DUMMY_PICKS);
+      } else {
+        setPicks(picks);
+      }
     } catch {
-      setPicks([]);
+      if (import.meta.env.DEV) {
+        setDate(new Date().toISOString().slice(0, 10));
+        setPicks(DUMMY_PICKS);
+      } else {
+        setPicks([]);
+      }
     }
   }, []);
 
   useEffect(() => { void fetchPicks(); }, [fetchPicks]);
+
+  const toggleCollapsed = () => {
+    setCollapsed((c) => {
+      const next = !c;
+      localStorage.setItem(PICKS_COLLAPSED_KEY, next ? '1' : '0');
+      return next;
+    });
+  };
 
   const refresh = async () => {
     setRefreshing(true);
@@ -2304,19 +2392,31 @@ function TodaysPicks({
   return (
     <section className="picks-section">
       <h2>
-        Today's picks · {date}
-        <button className="link-btn" onClick={refresh} disabled={refreshing}>
-          {refreshing ? 'refreshing…' : 'refresh'}
+        <button
+          type="button"
+          className="picks-toggle"
+          onClick={toggleCollapsed}
+          aria-expanded={!collapsed}
+          title={collapsed ? 'Expand' : 'Collapse'}
+        >
+          {collapsed ? '▸' : '▾'} Today's picks · {date}
         </button>
+        {!collapsed && (
+          <button className="link-btn" onClick={refresh} disabled={refreshing}>
+            {refreshing ? 'refreshing…' : 'refresh'}
+          </button>
+        )}
       </h2>
-      <div className={`bookmarks ${view}`}>
-        {picks.map((p) => (
-          <div key={p.bookmark.id} className="pick-wrap">
-            {p.reason && <div className="pick-reason">{p.reason}</div>}
-            <BookmarkCard b={p.bookmark} {...handlers} />
-          </div>
-        ))}
-      </div>
+      {!collapsed && (
+        <div className={`bookmarks ${view}`}>
+          {picks.map((p) => (
+            <div key={p.bookmark.id} className="pick-wrap">
+              {p.reason && <div className="pick-reason">{p.reason}</div>}
+              <BookmarkCard b={p.bookmark} {...handlers} />
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
