@@ -29,6 +29,9 @@ export interface BookmarkRow {
   last_viewed_at: number | null;
   content_excerpt: string | null;
   status: BookmarkStatus;
+  short_code: string | null;
+  click_count: number;
+  shortened_at: number | null;
   created_at: number;
   updated_at: number;
 }
