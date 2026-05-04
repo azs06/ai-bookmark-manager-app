@@ -1054,16 +1054,87 @@ section h2 {
   margin-bottom: 16px;
 }
 .shortlinks-summary-stats {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
 }
+.shortlinks-summary-stats > div { min-width: 64px; }
 .shortlinks-summary-stats .big-num {
-  font-size: 22px;
+  font-size: 26px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.shortlinks-summary-stats .small {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+  margin-top: 4px;
 }
 .shortlinks-summary .stats-chart { color: var(--accent); margin: 0; }
+.stats-chart-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  font-style: italic;
+  text-align: center;
+}
+
+.shortlinks-empty {
+  text-align: center;
+  padding: 48px 24px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-muted);
+  max-width: 520px;
+  margin: 24px auto;
+}
+.shortlinks-empty-icon { font-size: 36px; margin-bottom: 8px; }
+.shortlinks-empty h3 {
+  margin: 0 0 8px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  letter-spacing: var(--title-tracking);
+}
+.shortlinks-empty p { margin: 6px 0; color: var(--muted-strong); font-size: 14px; }
+.shortlinks-empty code {
+  background: var(--surface);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+}
+
+.short-url-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.short-url-text { font-variant-numeric: tabular-nums; }
+.copy-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.copy-icon-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.copy-icon-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 
 .alias-editor {
   display: inline-flex;
