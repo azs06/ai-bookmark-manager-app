@@ -16,6 +16,8 @@ interface Bookmark {
   status: string;
   content_type: string | null;
   metadata: string;  // raw JSON string; parse lazily in the card
+  short_code: string | null;
+  click_count: number;
   created_at: number;
 }
 
@@ -86,7 +88,7 @@ interface CategoriesPayload {
 
 type View = 'list' | 'grid';
 type Theme = 'light' | 'dark';
-type Mode = 'bookmarks' | 'feeds' | 'settings' | 'reader';
+type Mode = 'bookmarks' | 'feeds' | 'shortlinks' | 'settings' | 'reader';
 type Scope = { kind: 'all' } | { kind: 'uncategorized' } | { kind: 'category'; id: number };
 type Patch = Partial<Pick<Bookmark, 'importance' | 'note' | 'category_id'>>;
 type MinImportance = 0 | 1 | 2;
@@ -196,6 +198,9 @@ function readUrlState(): UrlState {
     if (path === '/settings') {
       return { mode: 'settings', scope: { kind: 'all' }, feedId: null, readerId: null };
     }
+    if (path === '/shortlinks') {
+      return { mode: 'shortlinks', scope: { kind: 'all' }, feedId: null, readerId: null };
+    }
     if (path === '/feeds' || p.get('view') === 'feeds') {
       const raw = p.get('feed_id');
       const feedId = raw && Number.isFinite(Number(raw)) ? Number(raw) : null;
@@ -212,6 +217,7 @@ function readUrlState(): UrlState {
 // /feeds and writing another feeds URL.
 function buildUrl(mode: Mode, scope: Scope): string {
   if (mode === 'settings') return '/settings';
+  if (mode === 'shortlinks') return '/shortlinks';
   if (mode === 'feeds') {
     const existing = new URLSearchParams(window.location.search).get('feed_id');
     return existing ? `/feeds?feed_id=${encodeURIComponent(existing)}` : '/feeds';
@@ -560,7 +566,7 @@ export default function App() {
           >
             ☰
           </button>
-          <h1>{mode === 'feeds' ? 'Feeds' : mode === 'settings' ? 'Settings' : scopeHeading}</h1>
+          <h1>{mode === 'feeds' ? 'Feeds' : mode === 'settings' ? 'Settings' : mode === 'shortlinks' ? 'Short links' : scopeHeading}</h1>
           {mode === 'bookmarks' && <span className="header-count">{total.toLocaleString()}</span>}
           {mode === 'bookmarks' && (
             <div className="controls">
@@ -573,6 +579,7 @@ export default function App() {
 
         {mode === 'settings' && <SettingsView onArchived={refresh} />}
         {mode === 'feeds' && <FeedsView initialFeedId={readUrlState().feedId} />}
+        {mode === 'shortlinks' && <ShortlinksView />}
         {mode === 'bookmarks' && (<>
         <AddForm onSaved={refresh} />
 
@@ -821,6 +828,12 @@ function Sidebar({
           {feedsUnread !== null && feedsUnread > 0 && (
             <span className="sidebar-item-count">{feedsUnread.toLocaleString()}</span>
           )}
+        </button>
+        <button
+          className={`sidebar-item${mode === 'shortlinks' ? ' active' : ''}`}
+          onClick={() => onModeChange('shortlinks')}
+        >
+          <span className="sidebar-item-label">Short links</span>
         </button>
       </nav>
 
@@ -2012,6 +2025,38 @@ function BookmarkCard({
   b, categories, onReenriched, onUpdate, onDelete, onToggleWatched,
 }: { b: Bookmark } & CardHandlers) {
   const [busy, setBusy] = useState(false);
+  const [shortCode, setShortCode] = useState<string | null>(b.short_code);
+  const [copyHint, setCopyHint] = useState<string | null>(null);
+  const [statsOpen, setStatsOpen] = useState(false);
+  const clickCount = b.click_count ?? 0;
+
+  // Sync local state if the parent reloads the row (e.g. after re-enrich).
+  useEffect(() => { setShortCode(b.short_code); }, [b.short_code]);
+
+  const shortenAndCopy = async () => {
+    let code = shortCode;
+    if (!code) {
+      try {
+        const r = await fetch(`/api/bookmarks/${b.id}/shorten`, { method: 'POST' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = (await r.json()) as { short_code: string };
+        code = d.short_code;
+        setShortCode(code);
+      } catch {
+        setCopyHint('Failed');
+        setTimeout(() => setCopyHint(null), 2000);
+        return;
+      }
+    }
+    const fullUrl = `${window.location.origin}/s/${code}`;
+    try {
+      await navigator.clipboard.writeText(fullUrl);
+      setCopyHint('Copied');
+    } catch {
+      setCopyHint(fullUrl);
+    }
+    setTimeout(() => setCopyHint(null), 2000);
+  };
 
   const reenrich = async () => {
     setBusy(true);
@@ -2086,6 +2131,24 @@ function BookmarkCard({
       </div>
       <div className="actions">
         <button
+          className={`icon-btn shorten-btn${shortCode ? ' has-code' : ''}`}
+          onClick={shortenAndCopy}
+          title={shortCode ? `Copy short URL (${shortCode})` : 'Shorten & copy URL'}
+          aria-label="Shorten and copy URL"
+        >
+          🔗
+        </button>
+        {shortCode && clickCount > 0 && (
+          <button
+            className="icon-btn click-badge"
+            onClick={() => setStatsOpen(true)}
+            title={`${clickCount.toLocaleString()} click${clickCount === 1 ? '' : 's'} — open stats`}
+          >
+            {clickCount.toLocaleString()}
+          </button>
+        )}
+        {copyHint && <span className="copy-hint" role="status">{copyHint}</span>}
+        <button
           className={`icon-btn importance-btn importance-${b.importance}`}
           onClick={cycleImportance}
           title={importanceLabel(b.importance)}
@@ -2142,7 +2205,248 @@ function BookmarkCard({
           ✕
         </button>
       </div>
+      {statsOpen && (
+        <ClickStatsModal bookmarkId={b.id} title={b.title ?? b.url} onClose={() => setStatsOpen(false)} />
+      )}
     </div>
+  );
+}
+
+interface ClickStats {
+  total: number;
+  counted: number;
+  daily: Array<{ day: string; count: number }>;
+  topReferers: Array<{ referer: string; count: number }>;
+  byCountry: Array<{ country: string; count: number }>;
+  byUaClass: Array<{ ua_class: string; count: number }>;
+}
+
+function ClickStatsModal({ bookmarkId, title, onClose }: { bookmarkId: number; title: string; onClose: () => void }) {
+  const [stats, setStats] = useState<ClickStats | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await fetch(`/api/bookmarks/${bookmarkId}/clicks`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = (await r.json()) as ClickStats;
+        if (!cancelled) setStats(d);
+      } catch (e) {
+        if (!cancelled) setError((e as Error).message);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [bookmarkId]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal stats-modal" onClick={(e) => e.stopPropagation()}>
+        <header className="stats-modal-head">
+          <div>
+            <div className="stats-modal-title">Click stats</div>
+            <div className="stats-modal-subtitle">{title}</div>
+          </div>
+          <button className="icon-btn" onClick={onClose} aria-label="Close">✕</button>
+        </header>
+        {!stats && !error && <p className="empty">Loading…</p>}
+        {error && <p className="empty">Error: {error}</p>}
+        {stats && (
+          <div className="stats-modal-body">
+            <div className="stats-totals">
+              <div><strong>{stats.counted.toLocaleString()}</strong> counted</div>
+              <div className="muted">{stats.total.toLocaleString()} total · {Math.max(0, stats.total - stats.counted).toLocaleString()} link previews</div>
+            </div>
+            <DailyBarChart daily={stats.daily} />
+            <div className="stats-tables">
+              <div>
+                <h4>Top referers</h4>
+                {stats.topReferers.length === 0 ? <p className="empty muted">No referer data yet.</p> : (
+                  <ul className="stats-list">
+                    {stats.topReferers.map((r) => (
+                      <li key={r.referer}><span className="stats-list-label" title={r.referer}>{r.referer}</span><span>{r.count.toLocaleString()}</span></li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+              <div>
+                <h4>Top countries</h4>
+                {stats.byCountry.length === 0 ? <p className="empty muted">No country data yet.</p> : (
+                  <ul className="stats-list">
+                    {stats.byCountry.map((c) => (
+                      <li key={c.country}><span className="stats-list-label">{c.country}</span><span>{c.count.toLocaleString()}</span></li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DailyBarChart({ daily }: { daily: Array<{ day: string; count: number }> }) {
+  const max = Math.max(1, ...daily.map((d) => d.count));
+  const width = 320;
+  const height = 80;
+  const barW = width / daily.length;
+  return (
+    <div className="stats-chart">
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="Daily clicks last 30 days">
+        {daily.map((d, i) => {
+          const h = (d.count / max) * (height - 2);
+          return (
+            <rect
+              key={d.day}
+              x={i * barW + 1}
+              y={height - h}
+              width={Math.max(1, barW - 2)}
+              height={h}
+              fill="currentColor"
+            >
+              <title>{d.day}: {d.count}</title>
+            </rect>
+          );
+        })}
+      </svg>
+      <div className="stats-chart-axis">
+        <span>{daily[0]?.day ?? ''}</span>
+        <span>{daily[daily.length - 1]?.day ?? ''}</span>
+      </div>
+    </div>
+  );
+}
+
+interface ShortlinkRow {
+  id: number;
+  url: string;
+  title: string | null;
+  domain: string | null;
+  short_code: string;
+  short_url: string;
+  click_count: number;
+  shortened_at: number | null;
+  created_at: number;
+  recent_7d: number;
+  prior_7d: number;
+}
+
+function ShortlinksView() {
+  const [rows, setRows] = useState<ShortlinkRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [sort, setSort] = useState<'clicks' | 'created'>('clicks');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [statsFor, setStatsFor] = useState<ShortlinkRow | null>(null);
+  const [copied, setCopied] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const sortParam = sort === 'created' ? 'created' : 'clicks';
+      const r = await fetch(`/api/shortlinks?sort=${sortParam}&limit=100`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = (await r.json()) as { shortlinks: ShortlinkRow[]; total: number };
+      setRows(d.shortlinks ?? []);
+      setTotal(d.total ?? 0);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }, [sort]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const copyShort = async (row: ShortlinkRow) => {
+    try {
+      await navigator.clipboard.writeText(row.short_url);
+      setCopied(row.id);
+      setTimeout(() => setCopied((id) => (id === row.id ? null : id)), 1500);
+    } catch {
+      // Clipboard blocked — leave the URL visible so user can select it.
+    }
+  };
+
+  return (
+    <section className="shortlinks-view">
+      <div className="shortlinks-toolbar">
+        <span className="muted">{total.toLocaleString()} shortened bookmark{total === 1 ? '' : 's'}</span>
+        <div className="shortlinks-sort">
+          <button
+            className={sort === 'clicks' ? 'active' : ''}
+            onClick={() => setSort('clicks')}
+          >Most clicked</button>
+          <button
+            className={sort === 'created' ? 'active' : ''}
+            onClick={() => setSort('created')}
+          >Recently shortened</button>
+        </div>
+      </div>
+      {loading && <p className="empty">Loading…</p>}
+      {error && <p className="empty">Error: {error}</p>}
+      {!loading && !error && rows.length === 0 && (
+        <p className="empty">No short links yet. Click the 🔗 button on any bookmark — or use the Chrome extension's “Shorten &amp; copy URL.”</p>
+      )}
+      {!loading && !error && rows.length > 0 && (
+        <table className="shortlinks-table">
+          <thead>
+            <tr>
+              <th>Bookmark</th>
+              <th>Short URL</th>
+              <th className="num">Clicks</th>
+              <th className="num">Last 7d</th>
+              <th>Trend</th>
+              <th aria-label="Stats" />
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => {
+              const delta = row.recent_7d - row.prior_7d;
+              const arrow = delta > 0 ? '▲' : delta < 0 ? '▼' : '–';
+              return (
+                <tr key={row.id}>
+                  <td>
+                    <a href={row.url} target="_blank" rel="noreferrer">{row.title ?? row.url}</a>
+                    <div className="muted small">{row.domain}</div>
+                  </td>
+                  <td>
+                    <button className="link-btn" onClick={() => void copyShort(row)} title="Copy short URL">
+                      {copied === row.id ? 'Copied' : `/s/${row.short_code}`}
+                    </button>
+                  </td>
+                  <td className="num">{row.click_count.toLocaleString()}</td>
+                  <td className="num">{row.recent_7d.toLocaleString()}</td>
+                  <td className={`trend ${delta > 0 ? 'up' : delta < 0 ? 'down' : ''}`}>
+                    {arrow} {delta === 0 ? '0' : (delta > 0 ? `+${delta}` : delta)}
+                  </td>
+                  <td>
+                    <button className="link-btn" onClick={() => setStatsFor(row)}>Stats</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      {statsFor && (
+        <ClickStatsModal
+          bookmarkId={statsFor.id}
+          title={statsFor.title ?? statsFor.url}
+          onClose={() => setStatsFor(null)}
+        />
+      )}
+    </section>
   );
 }
 
@@ -2288,6 +2592,8 @@ const DUMMY_PICKS: PickEnvelope[] = [
       status: 'active',
       content_type: 'article',
       metadata: '{}',
+      short_code: null,
+      click_count: 0,
       created_at: Date.now() - 1000 * 60 * 60 * 6,
     },
   },
@@ -2307,6 +2613,8 @@ const DUMMY_PICKS: PickEnvelope[] = [
       status: 'active',
       content_type: 'video',
       metadata: JSON.stringify({ channel: 'Cloudflare', durationSec: 1342 }),
+      short_code: null,
+      click_count: 0,
       created_at: Date.now() - 1000 * 60 * 60 * 24 * 2,
     },
   },
@@ -2326,6 +2634,8 @@ const DUMMY_PICKS: PickEnvelope[] = [
       status: 'active',
       content_type: 'article',
       metadata: '{}',
+      short_code: null,
+      click_count: 0,
       created_at: Date.now() - 1000 * 60 * 60 * 24 * 21,
     },
   },

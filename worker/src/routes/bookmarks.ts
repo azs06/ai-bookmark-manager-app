@@ -7,6 +7,7 @@ import { detectYouTube } from '../lib/youtube';
 import { detectX } from '../lib/x';
 import { detectReddit, fetchRedditPost, type RedditPostData } from '../lib/reddit';
 import { probeUrl } from '../lib/health';
+import { assignShortCode, buildShortUrl } from '../lib/shortlinks';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -18,20 +19,22 @@ interface ExistingBookmark {
   ai_summary: string | null;
   ai_tags: string;
   content_excerpt: string | null;
+  short_code: string | null;
 }
 
 app.post('/', async (c) => {
-  const body = await c.req.json<{ url?: string; title?: string; note?: string }>();
+  const body = await c.req.json<{ url?: string; title?: string; note?: string; auto_shorten?: boolean }>();
   if (!body.url) return c.json({ error: 'url required' }, 400);
 
   const normalized = normalizeUrl(body.url);
   const urlHash = await hashUrl(normalized);
   const domain = new URL(normalized).hostname;
   const now = Date.now();
+  const wantsShorten = body.auto_shorten === true;
 
   const existing = await c.env.DB
     .prepare(`
-      SELECT id, status, title, note, ai_summary, ai_tags, content_excerpt
+      SELECT id, status, title, note, ai_summary, ai_tags, content_excerpt, short_code
       FROM bookmarks
       WHERE url_hash = ?
     `)
@@ -64,14 +67,36 @@ app.post('/', async (c) => {
         }),
       );
 
-      return c.json({ id: existing.id, duplicate: false, restored: true, status: restoredStatus });
+      const shortFields = wantsShorten
+        ? await mintShortFields(c.env, existing.id, c.req.url)
+        : null;
+
+      return c.json({
+        id: existing.id,
+        duplicate: false,
+        restored: true,
+        status: restoredStatus,
+        ...(shortFields ?? {}),
+      });
     }
 
     await c.env.DB
       .prepare('UPDATE bookmarks SET updated_at = ? WHERE id = ?')
       .bind(now, existing.id)
       .run();
-    return c.json({ id: existing.id, duplicate: true, status: existing.status });
+
+    const shortFields = wantsShorten
+      ? existing.short_code
+        ? { short_code: existing.short_code, short_url: buildShortUrl(c.req.url, existing.short_code) }
+        : await mintShortFields(c.env, existing.id, c.req.url)
+      : null;
+
+    return c.json({
+      id: existing.id,
+      duplicate: true,
+      status: existing.status,
+      ...(shortFields ?? {}),
+    });
   }
 
   // Stamp content_type + minimal metadata at insert time so the list view
@@ -99,8 +124,49 @@ app.post('/', async (c) => {
 
   c.executionCtx.waitUntil(enrich(c.env, id));
 
-  return c.json({ id, duplicate: false, status: 'pending', content_type: contentType });
+  const shortFields = wantsShorten
+    ? await mintShortFields(c.env, id, c.req.url)
+    : null;
+
+  return c.json({
+    id,
+    duplicate: false,
+    status: 'pending',
+    content_type: contentType,
+    ...(shortFields ?? {}),
+  });
 });
+
+// Idempotent shortening for an existing bookmark. The extension calls this
+// indirectly via auto_shorten on POST /; the webapp calls it directly when
+// the user clicks a card-level shorten button.
+app.post('/:id{[0-9]+}/shorten', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+
+  try {
+    const { code, created } = await assignShortCode(c.env, id);
+    return c.json({
+      id,
+      short_code: code,
+      short_url: buildShortUrl(c.req.url, code),
+      created,
+    });
+  } catch (err) {
+    const message = (err as Error).message ?? 'shorten failed';
+    if (message === 'bookmark not found') return c.json({ error: message }, 404);
+    return c.json({ error: message }, 500);
+  }
+});
+
+async function mintShortFields(
+  env: Env,
+  bookmarkId: number,
+  requestUrl: string,
+): Promise<{ short_code: string; short_url: string }> {
+  const { code } = await assignShortCode(env, bookmarkId);
+  return { short_code: code, short_url: buildShortUrl(requestUrl, code) };
+}
 
 app.get('/', async (c) => {
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '50'), 1), 100);
@@ -126,7 +192,8 @@ app.get('/', async (c) => {
     .prepare(`
       SELECT b.id, b.url, b.title, b.note, b.og_image_url, b.domain,
              b.ai_summary, b.ai_tags, b.category_id, b.importance, b.status,
-             b.content_type, b.metadata, b.created_at
+             b.content_type, b.metadata, b.short_code, b.click_count,
+             b.created_at
       ${from}
       WHERE ${finalWhere}
       ORDER BY b.importance DESC, b.created_at DESC, b.id DESC
@@ -197,7 +264,8 @@ app.get('/:id{[0-9]+}', async (c) => {
     .prepare(`
       SELECT id, url, title, note, og_image_url, domain,
              ai_summary, ai_tags, category_id, importance, status,
-             content_type, metadata, created_at
+             content_type, metadata, short_code, click_count, shortened_at,
+             created_at
       FROM bookmarks
       WHERE id = ?
     `)
@@ -206,6 +274,96 @@ app.get('/:id{[0-9]+}', async (c) => {
   if (!row) return c.json({ error: 'not found' }, 404);
   return c.json({ bookmark: row });
 });
+
+// Per-bookmark click analytics for the stats modal. 30-day daily series is
+// zero-filled in JS rather than via a SQL CTE — D1's recursive CTE syntax
+// works but the JS path is simpler and keeps the SQL focused on aggregation.
+app.get('/:id{[0-9]+}/clicks', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+
+  const exists = await c.env.DB
+    .prepare('SELECT id, click_count FROM bookmarks WHERE id = ?')
+    .bind(id)
+    .first<{ id: number; click_count: number }>();
+  if (!exists) return c.json({ error: 'not found' }, 404);
+
+  const since = Date.now() - 30 * 24 * 60 * 60 * 1000;
+
+  const [totalRow, dailyRows, refererRows, countryRows, uaRows] = await Promise.all([
+    c.env.DB
+      .prepare('SELECT COUNT(*) AS n FROM shortlink_clicks WHERE bookmark_id = ?')
+      .bind(id)
+      .first<{ n: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT strftime('%Y-%m-%d', ts / 1000, 'unixepoch') AS day, COUNT(*) AS count
+        FROM shortlink_clicks
+        WHERE bookmark_id = ? AND ts >= ?
+        GROUP BY day
+        ORDER BY day ASC
+      `)
+      .bind(id, since)
+      .all<{ day: string; count: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT COALESCE(referer, '(direct)') AS referer, COUNT(*) AS count
+        FROM shortlink_clicks
+        WHERE bookmark_id = ?
+        GROUP BY referer
+        ORDER BY count DESC
+        LIMIT 10
+      `)
+      .bind(id)
+      .all<{ referer: string; count: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT COALESCE(country, '??') AS country, COUNT(*) AS count
+        FROM shortlink_clicks
+        WHERE bookmark_id = ?
+        GROUP BY country
+        ORDER BY count DESC
+        LIMIT 10
+      `)
+      .bind(id)
+      .all<{ country: string; count: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT COALESCE(ua_class, 'unknown') AS ua_class, COUNT(*) AS count
+        FROM shortlink_clicks
+        WHERE bookmark_id = ?
+        GROUP BY ua_class
+      `)
+      .bind(id)
+      .all<{ ua_class: string; count: number }>(),
+  ]);
+
+  const daily = zeroFillDaily(dailyRows.results ?? [], 30);
+
+  return c.json({
+    id,
+    total: totalRow?.n ?? 0,
+    counted: exists.click_count, // excludes bots; matches the leaderboard
+    daily,
+    topReferers: refererRows.results ?? [],
+    byCountry: countryRows.results ?? [],
+    byUaClass: uaRows.results ?? [],
+  });
+});
+
+function zeroFillDaily(rows: Array<{ day: string; count: number }>, days: number): Array<{ day: string; count: number }> {
+  const have = new Map(rows.map((r) => [r.day, r.count]));
+  const out: Array<{ day: string; count: number }> = [];
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(today);
+    d.setUTCDate(d.getUTCDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    out.push({ day: key, count: have.get(key) ?? 0 });
+  }
+  return out;
+}
 
 app.patch('/:id', async (c) => {
   const id = Number(c.req.param('id'));
