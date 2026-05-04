@@ -166,8 +166,15 @@ export async function shortlinkRedirect(
     .bind(code)
     .first<{ id: number; url: string; status: string }>();
 
-  if (!row) return new Response('not found', { status: 404 });
-  if (row.status === 'archived') return new Response('gone', { status: 410 });
+  // no-store on every response (404, 410, redirect) so a future broken-window
+  // state can't leave a misrouted /s/:code in any browser's cache. Without
+  // this, a transient SPA-fallback at this path bakes into the browser as a
+  // cached 200 HTML response that overrides later 302s until the user
+  // hard-refreshes.
+  const noCache = { 'Cache-Control': 'no-store' };
+
+  if (!row) return new Response('not found', { status: 404, headers: noCache });
+  if (row.status === 'archived') return new Response('gone', { status: 410, headers: noCache });
 
   ctx.waitUntil(
     recordClick(env, row.id, request).catch((err) => {
@@ -175,5 +182,8 @@ export async function shortlinkRedirect(
     }),
   );
 
-  return Response.redirect(row.url, 302);
+  return new Response(null, {
+    status: 302,
+    headers: { ...noCache, Location: row.url },
+  });
 }

@@ -2463,55 +2463,72 @@ function ShortlinksView() {
     );
   }, [rows, filter]);
 
+  const hasLinks = rows.length > 0;
+  const hasClicks = (summary?.counted_total ?? 0) > 0;
+  const previewClicks = summary ? Math.max(0, summary.raw_total - summary.counted_total) : 0;
+
   return (
     <section className="shortlinks-view">
-      {summary && (
+      {summary && hasLinks && (
         <div className="shortlinks-summary">
           <div className="shortlinks-summary-stats">
             <div>
               <div className="big-num">{summary.counted_total.toLocaleString()}</div>
-              <div className="muted small">total clicks</div>
+              <div className="muted small">clicks</div>
             </div>
             <div>
               <div className="big-num">{summary.links.toLocaleString()}</div>
-              <div className="muted small">short links</div>
+              <div className="muted small">links</div>
             </div>
-            <div>
-              <div className="big-num">{Math.max(0, summary.raw_total - summary.counted_total).toLocaleString()}</div>
-              <div className="muted small">link previews (bots)</div>
-            </div>
+            {previewClicks > 0 && (
+              <div>
+                <div className="big-num">{previewClicks.toLocaleString()}</div>
+                <div className="muted small">previews</div>
+              </div>
+            )}
           </div>
-          <DailyBarChart daily={summary.daily} />
+          {hasClicks ? (
+            <DailyBarChart daily={summary.daily} />
+          ) : (
+            <div className="stats-chart-empty muted small">No clicks recorded yet — share a short URL to start tracking.</div>
+          )}
         </div>
       )}
 
-      <div className="shortlinks-toolbar">
-        <input
-          className="search-input shortlinks-search"
-          type="search"
-          placeholder="Filter by title, domain, or code…"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-        />
-        <span className="muted">{visibleRows.length.toLocaleString()} of {total.toLocaleString()}</span>
-        <div className="shortlinks-sort">
-          <button
-            className={sort === 'clicks' ? 'active' : ''}
-            onClick={() => setSort('clicks')}
-          >Most clicked</button>
-          <button
-            className={sort === 'created' ? 'active' : ''}
-            onClick={() => setSort('created')}
-          >Recently shortened</button>
+      {hasLinks && (
+        <div className="shortlinks-toolbar">
+          <input
+            className="search-input shortlinks-search"
+            type="search"
+            placeholder="Filter by title, domain, or code…"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+          <span className="muted">{visibleRows.length.toLocaleString()} of {total.toLocaleString()}</span>
+          <div className="shortlinks-sort">
+            <button
+              className={sort === 'clicks' ? 'active' : ''}
+              onClick={() => setSort('clicks')}
+            >Most clicked</button>
+            <button
+              className={sort === 'created' ? 'active' : ''}
+              onClick={() => setSort('created')}
+            >Recently shortened</button>
+          </div>
         </div>
-      </div>
+      )}
 
       {loading && <p className="empty">Loading…</p>}
       {error && <p className="empty">Error: {error}</p>}
-      {!loading && !error && rows.length === 0 && (
-        <p className="empty">No short links yet. Click the 🔗 button on any bookmark — or use the Chrome extension's “Shorten &amp; copy URL.”</p>
+      {!loading && !error && !hasLinks && (
+        <div className="shortlinks-empty">
+          <div className="shortlinks-empty-icon" aria-hidden>🔗</div>
+          <h3>No short links yet</h3>
+          <p>Open any bookmark and click the <strong>🔗</strong> button to mint a short URL — or use the Chrome extension's <strong>“Shorten &amp; copy URL”</strong> on any page.</p>
+          <p className="muted small">Short URLs look like <code>{window.location.origin}/s/aB3xZ9</code> and track clicks automatically.</p>
+        </div>
       )}
-      {!loading && !error && rows.length > 0 && visibleRows.length === 0 && (
+      {!loading && !error && hasLinks && visibleRows.length === 0 && (
         <p className="empty muted">No matches for “{filter}”.</p>
       )}
       {!loading && !error && visibleRows.length > 0 && (
@@ -2558,9 +2575,28 @@ function ShortlinksView() {
                         {aliasError && <div className="alias-error">{aliasError}</div>}
                       </div>
                     ) : (
-                      <button className="link-btn" onClick={() => void copyShort(row)} title="Copy short URL">
-                        {copied === row.id ? 'Copied' : `/s/${row.short_code}`}
-                      </button>
+                      <div className="short-url-cell">
+                        <button className="link-btn short-url-text" onClick={() => void copyShort(row)} title={`Copy ${row.short_url}`}>
+                          /s/{row.short_code}
+                        </button>
+                        <button
+                          className="copy-icon-btn"
+                          onClick={() => void copyShort(row)}
+                          title={`Copy ${row.short_url}`}
+                          aria-label="Copy short URL"
+                        >
+                          {copied === row.id ? (
+                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                              <polyline points="20 6 9 17 4 12" />
+                            </svg>
+                          ) : (
+                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                              <rect x="9" y="9" width="11" height="11" rx="2" />
+                              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                            </svg>
+                          )}
+                        </button>
+                      </div>
                     )}
                   </td>
                   <td className="num">{row.click_count.toLocaleString()}</td>
