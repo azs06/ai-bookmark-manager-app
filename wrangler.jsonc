@@ -9,7 +9,11 @@
     "directory": "./web/dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/s/*"]
+    // Worker-handled paths must be listed here. Patterns NOT in this list
+    // skip the Worker entirely and go to the asset binding — so omitting
+    // /api/* would route every API call to the SPA fallback, which returns
+    // index.html and the SPA's fetch() chokes on "<!doctype" not being JSON.
+    "run_worker_first": ["/s/*", "/api/*"]
   },
 
   "d1_databases": [
@@ -71,12 +75,13 @@
       // Mirror top-level assets config — bindings (incl. assets) are NOT
       // inherited into named envs, so omitting this would leave production
       // without `run_worker_first` and the /s/:code redirect would be eaten
-      // by the SPA fallback again.
+      // by the SPA fallback again. /api/* must also be listed; patterns NOT
+      // in run_worker_first skip the Worker entirely.
       "assets": {
         "directory": "./web/dist",
         "binding": "ASSETS",
         "not_found_handling": "single-page-application",
-        "run_worker_first": ["/s/*"]
+        "run_worker_first": ["/s/*", "/api/*"]
       },
 
       "vars": {
