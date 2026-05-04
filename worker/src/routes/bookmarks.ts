@@ -7,7 +7,7 @@ import { detectYouTube } from '../lib/youtube';
 import { detectX } from '../lib/x';
 import { detectReddit, fetchRedditPost, type RedditPostData } from '../lib/reddit';
 import { probeUrl } from '../lib/health';
-import { assignShortCode, buildShortUrl } from '../lib/shortlinks';
+import { assignShortCode, buildShortUrl, generateShortCode, validateAlias } from '../lib/shortlinks';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -167,6 +167,145 @@ async function mintShortFields(
   const { code } = await assignShortCode(env, bookmarkId);
   return { short_code: code, short_url: buildShortUrl(requestUrl, code) };
 }
+
+// Revoke a short link. Hard reset: NULL the code, drop click history, zero
+// the counter. The bookmark itself survives — only the shortener attribute
+// is removed. Re-shortening later starts from a clean slate so old metrics
+// don't bleed into the new code's stats.
+app.delete('/:id{[0-9]+}/shorten', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+
+  const exists = await c.env.DB
+    .prepare('SELECT id, short_code FROM bookmarks WHERE id = ?')
+    .bind(id)
+    .first<{ id: number; short_code: string | null }>();
+  if (!exists) return c.json({ error: 'not found' }, 404);
+  if (!exists.short_code) return c.json({ ok: true, revoked: false });
+
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare('DELETE FROM shortlink_clicks WHERE bookmark_id = ?')
+      .bind(id),
+    c.env.DB
+      .prepare(`
+        UPDATE bookmarks
+        SET short_code = NULL, shortened_at = NULL, click_count = 0, updated_at = ?
+        WHERE id = ?
+      `)
+      .bind(now, id),
+  ]);
+
+  return c.json({ ok: true, revoked: true });
+});
+
+// Regenerate the short code while keeping click history. The old code
+// becomes a 404 immediately. Use case: code leaked, want a fresh share URL
+// without losing the visibility/reach metrics for that bookmark.
+app.post('/:id{[0-9]+}/shorten/regenerate', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+
+  const exists = await c.env.DB
+    .prepare('SELECT id, short_code FROM bookmarks WHERE id = ?')
+    .bind(id)
+    .first<{ id: number; short_code: string | null }>();
+  if (!exists) return c.json({ error: 'not found' }, 404);
+  if (!exists.short_code) return c.json({ error: 'bookmark has no short code yet — use POST /shorten instead' }, 400);
+
+  const now = Date.now();
+  let newCode: string | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const candidate = generateShortCode();
+    try {
+      const result = await c.env.DB
+        .prepare(`
+          UPDATE bookmarks
+          SET short_code = ?, shortened_at = ?, updated_at = ?
+          WHERE id = ?
+        `)
+        .bind(candidate, now, now, id)
+        .run();
+      if ((result.meta.changes ?? 0) > 0) {
+        newCode = candidate;
+        break;
+      }
+    } catch (err) {
+      if (!/UNIQUE/i.test((err as Error).message ?? '')) throw err;
+    }
+  }
+  if (!newCode) return c.json({ error: 'failed to allocate short code after retries' }, 500);
+
+  return c.json({
+    id,
+    short_code: newCode,
+    short_url: buildShortUrl(c.req.url, newCode),
+    previous_code: exists.short_code,
+  });
+});
+
+// Set a custom alias for the short code. Also serves as the rename path —
+// PATCH replaces whatever code is currently there. 3-32 chars, alphanumerics
+// + - + _, not pure-numeric. Returns 409 if the alias is taken by another
+// bookmark, 400 on charset violation. Click history is preserved (rename,
+// not reset).
+app.patch('/:id{[0-9]+}/shorten', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+
+  const body = await c.req.json<{ alias?: string }>();
+  if (!body.alias || typeof body.alias !== 'string') {
+    return c.json({ error: 'alias (string) required' }, 400);
+  }
+  const alias = body.alias.trim();
+  const validation = validateAlias(alias);
+  if (!validation.ok) {
+    return c.json({
+      error: validation.reason === 'numeric_only'
+        ? 'alias cannot be all digits'
+        : 'alias must be 3-32 chars, letters/digits/hyphen/underscore only',
+    }, 400);
+  }
+
+  const exists = await c.env.DB
+    .prepare('SELECT id, short_code FROM bookmarks WHERE id = ?')
+    .bind(id)
+    .first<{ id: number; short_code: string | null }>();
+  if (!exists) return c.json({ error: 'not found' }, 404);
+  if (exists.short_code === alias) {
+    return c.json({
+      id,
+      short_code: alias,
+      short_url: buildShortUrl(c.req.url, alias),
+      changed: false,
+    });
+  }
+
+  const collision = await c.env.DB
+    .prepare('SELECT id FROM bookmarks WHERE short_code = ? AND id != ?')
+    .bind(alias, id)
+    .first<{ id: number }>();
+  if (collision) return c.json({ error: 'alias already in use', existing_id: collision.id }, 409);
+
+  const now = Date.now();
+  await c.env.DB
+    .prepare(`
+      UPDATE bookmarks
+      SET short_code = ?, shortened_at = COALESCE(shortened_at, ?), updated_at = ?
+      WHERE id = ?
+    `)
+    .bind(alias, now, now, id)
+    .run();
+
+  return c.json({
+    id,
+    short_code: alias,
+    short_url: buildShortUrl(c.req.url, alias),
+    previous_code: exists.short_code,
+    changed: true,
+  });
+});
 
 app.get('/', async (c) => {
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? '50'), 1), 100);

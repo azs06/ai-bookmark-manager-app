@@ -2340,24 +2340,45 @@ interface ShortlinkRow {
   prior_7d: number;
 }
 
+interface ShortlinksSummary {
+  links: number;
+  counted_total: number;
+  raw_total: number;
+  daily: Array<{ day: string; count: number }>;
+  top_links: Array<{ id: number; title: string | null; url: string; short_code: string; click_count: number }>;
+  top_referers: Array<{ referer: string; count: number }>;
+}
+
 function ShortlinksView() {
   const [rows, setRows] = useState<ShortlinkRow[]>([]);
   const [total, setTotal] = useState(0);
+  const [summary, setSummary] = useState<ShortlinksSummary | null>(null);
   const [sort, setSort] = useState<'clicks' | 'created'>('clicks');
+  const [filter, setFilter] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statsFor, setStatsFor] = useState<ShortlinkRow | null>(null);
   const [copied, setCopied] = useState<number | null>(null);
+  const [editingAlias, setEditingAlias] = useState<number | null>(null);
+  const [aliasDraft, setAliasDraft] = useState('');
+  const [aliasError, setAliasError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const sortParam = sort === 'created' ? 'created' : 'clicks';
-      const r = await fetch(`/api/shortlinks?sort=${sortParam}&limit=100`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = (await r.json()) as { shortlinks: ShortlinkRow[]; total: number };
+      const [listRes, summaryRes] = await Promise.all([
+        fetch(`/api/shortlinks?sort=${sortParam}&limit=200`),
+        fetch('/api/shortlinks/summary'),
+      ]);
+      if (!listRes.ok) throw new Error(`HTTP ${listRes.status}`);
+      const d = (await listRes.json()) as { shortlinks: ShortlinkRow[]; total: number };
       setRows(d.shortlinks ?? []);
       setTotal(d.total ?? 0);
+      if (summaryRes.ok) {
+        setSummary((await summaryRes.json()) as ShortlinksSummary);
+      }
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -2378,10 +2399,101 @@ function ShortlinksView() {
     }
   };
 
+  const startEditAlias = (row: ShortlinkRow) => {
+    setEditingAlias(row.id);
+    setAliasDraft(row.short_code);
+    setAliasError(null);
+  };
+
+  const saveAlias = async (row: ShortlinkRow) => {
+    const next = aliasDraft.trim();
+    if (!next || next === row.short_code) {
+      setEditingAlias(null);
+      return;
+    }
+    setBusyId(row.id);
+    setAliasError(null);
+    try {
+      const r = await fetch(`/api/bookmarks/${row.id}/shorten`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alias: next }),
+      });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        setAliasError(d.error ?? `HTTP ${r.status}`);
+        return;
+      }
+      setEditingAlias(null);
+      await load();
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const regenerate = async (row: ShortlinkRow) => {
+    if (!confirm(`Replace /s/${row.short_code} with a new code? The old URL will start returning 404.`)) return;
+    setBusyId(row.id);
+    try {
+      const r = await fetch(`/api/bookmarks/${row.id}/shorten/regenerate`, { method: 'POST' });
+      if (r.ok) await load();
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const revoke = async (row: ShortlinkRow) => {
+    if (!confirm(`Revoke /s/${row.short_code}? The bookmark stays, but the short URL will 404 and click history is cleared.`)) return;
+    setBusyId(row.id);
+    try {
+      const r = await fetch(`/api/bookmarks/${row.id}/shorten`, { method: 'DELETE' });
+      if (r.ok) await load();
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const visibleRows = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter((r) =>
+      (r.title ?? '').toLowerCase().includes(q) ||
+      (r.domain ?? '').toLowerCase().includes(q) ||
+      r.short_code.toLowerCase().includes(q),
+    );
+  }, [rows, filter]);
+
   return (
     <section className="shortlinks-view">
+      {summary && (
+        <div className="shortlinks-summary">
+          <div className="shortlinks-summary-stats">
+            <div>
+              <div className="big-num">{summary.counted_total.toLocaleString()}</div>
+              <div className="muted small">total clicks</div>
+            </div>
+            <div>
+              <div className="big-num">{summary.links.toLocaleString()}</div>
+              <div className="muted small">short links</div>
+            </div>
+            <div>
+              <div className="big-num">{Math.max(0, summary.raw_total - summary.counted_total).toLocaleString()}</div>
+              <div className="muted small">link previews (bots)</div>
+            </div>
+          </div>
+          <DailyBarChart daily={summary.daily} />
+        </div>
+      )}
+
       <div className="shortlinks-toolbar">
-        <span className="muted">{total.toLocaleString()} shortened bookmark{total === 1 ? '' : 's'}</span>
+        <input
+          className="search-input shortlinks-search"
+          type="search"
+          placeholder="Filter by title, domain, or code…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        <span className="muted">{visibleRows.length.toLocaleString()} of {total.toLocaleString()}</span>
         <div className="shortlinks-sort">
           <button
             className={sort === 'clicks' ? 'active' : ''}
@@ -2393,12 +2505,16 @@ function ShortlinksView() {
           >Recently shortened</button>
         </div>
       </div>
+
       {loading && <p className="empty">Loading…</p>}
       {error && <p className="empty">Error: {error}</p>}
       {!loading && !error && rows.length === 0 && (
         <p className="empty">No short links yet. Click the 🔗 button on any bookmark — or use the Chrome extension's “Shorten &amp; copy URL.”</p>
       )}
-      {!loading && !error && rows.length > 0 && (
+      {!loading && !error && rows.length > 0 && visibleRows.length === 0 && (
+        <p className="empty muted">No matches for “{filter}”.</p>
+      )}
+      {!loading && !error && visibleRows.length > 0 && (
         <table className="shortlinks-table">
           <thead>
             <tr>
@@ -2407,31 +2523,56 @@ function ShortlinksView() {
               <th className="num">Clicks</th>
               <th className="num">Last 7d</th>
               <th>Trend</th>
-              <th aria-label="Stats" />
+              <th aria-label="Actions" />
             </tr>
           </thead>
           <tbody>
-            {rows.map((row) => {
+            {visibleRows.map((row) => {
               const delta = row.recent_7d - row.prior_7d;
               const arrow = delta > 0 ? '▲' : delta < 0 ? '▼' : '–';
+              const isEditing = editingAlias === row.id;
+              const rowBusy = busyId === row.id;
               return (
-                <tr key={row.id}>
+                <tr key={row.id} className={rowBusy ? 'is-busy' : ''}>
                   <td>
                     <a href={row.url} target="_blank" rel="noreferrer">{row.title ?? row.url}</a>
                     <div className="muted small">{row.domain}</div>
                   </td>
                   <td>
-                    <button className="link-btn" onClick={() => void copyShort(row)} title="Copy short URL">
-                      {copied === row.id ? 'Copied' : `/s/${row.short_code}`}
-                    </button>
+                    {isEditing ? (
+                      <div className="alias-editor">
+                        <span className="alias-prefix">/s/</span>
+                        <input
+                          className="alias-input"
+                          value={aliasDraft}
+                          autoFocus
+                          onChange={(e) => { setAliasDraft(e.target.value); setAliasError(null); }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') void saveAlias(row);
+                            if (e.key === 'Escape') { setEditingAlias(null); setAliasError(null); }
+                          }}
+                          disabled={rowBusy}
+                        />
+                        <button className="link-btn" onClick={() => void saveAlias(row)} disabled={rowBusy}>Save</button>
+                        <button className="link-btn muted" onClick={() => { setEditingAlias(null); setAliasError(null); }} disabled={rowBusy}>Cancel</button>
+                        {aliasError && <div className="alias-error">{aliasError}</div>}
+                      </div>
+                    ) : (
+                      <button className="link-btn" onClick={() => void copyShort(row)} title="Copy short URL">
+                        {copied === row.id ? 'Copied' : `/s/${row.short_code}`}
+                      </button>
+                    )}
                   </td>
                   <td className="num">{row.click_count.toLocaleString()}</td>
                   <td className="num">{row.recent_7d.toLocaleString()}</td>
                   <td className={`trend ${delta > 0 ? 'up' : delta < 0 ? 'down' : ''}`}>
                     {arrow} {delta === 0 ? '0' : (delta > 0 ? `+${delta}` : delta)}
                   </td>
-                  <td>
-                    <button className="link-btn" onClick={() => setStatsFor(row)}>Stats</button>
+                  <td className="row-actions">
+                    <button className="link-btn" onClick={() => setStatsFor(row)} disabled={rowBusy}>Stats</button>
+                    <button className="link-btn" onClick={() => startEditAlias(row)} disabled={rowBusy || isEditing}>Edit alias</button>
+                    <button className="link-btn" onClick={() => void regenerate(row)} disabled={rowBusy}>Regenerate</button>
+                    <button className="link-btn danger" onClick={() => void revoke(row)} disabled={rowBusy}>Revoke</button>
                   </td>
                 </tr>
               );

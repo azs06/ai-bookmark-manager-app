@@ -66,6 +66,82 @@ app.get('/', async (c) => {
   });
 });
 
+// Aggregate analytics across every shortened bookmark. Powers the dashboard
+// summary card. counted_total reflects the leaderboard semantic (bot clicks
+// excluded); raw_total includes them so the user can see the gap. The 30-day
+// daily series is zero-filled in JS, mirroring the per-bookmark stats.
+app.get('/summary', async (c) => {
+  const since30d = Date.now() - 30 * 24 * 60 * 60 * 1000;
+
+  const [linksRow, totalsRow, dailyRows, topLinksRows, topReferersRows] = await Promise.all([
+    c.env.DB
+      .prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE short_code IS NOT NULL AND status != 'archived'`)
+      .first<{ n: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT
+          COUNT(*) AS raw_total,
+          COUNT(*) FILTER (WHERE ua_class != 'bot' OR ua_class IS NULL) AS counted_total
+        FROM shortlink_clicks
+      `)
+      .first<{ raw_total: number; counted_total: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT strftime('%Y-%m-%d', ts/1000, 'unixepoch') AS day, COUNT(*) AS count
+        FROM shortlink_clicks
+        WHERE ts >= ? AND (ua_class != 'bot' OR ua_class IS NULL)
+        GROUP BY day
+        ORDER BY day ASC
+      `)
+      .bind(since30d)
+      .all<{ day: string; count: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT b.id, b.title, b.url, b.short_code, b.click_count
+        FROM bookmarks b
+        WHERE b.short_code IS NOT NULL AND b.status != 'archived' AND b.click_count > 0
+        ORDER BY b.click_count DESC
+        LIMIT 5
+      `)
+      .all<{ id: number; title: string | null; url: string; short_code: string; click_count: number }>(),
+    c.env.DB
+      .prepare(`
+        SELECT COALESCE(referer, '(direct)') AS referer, COUNT(*) AS count
+        FROM shortlink_clicks
+        WHERE ua_class != 'bot' OR ua_class IS NULL
+        GROUP BY referer
+        ORDER BY count DESC
+        LIMIT 5
+      `)
+      .all<{ referer: string; count: number }>(),
+  ]);
+
+  const daily = zeroFillDaily(dailyRows.results ?? [], 30);
+
+  return c.json({
+    links: linksRow?.n ?? 0,
+    counted_total: totalsRow?.counted_total ?? 0,
+    raw_total: totalsRow?.raw_total ?? 0,
+    daily,
+    top_links: topLinksRows.results ?? [],
+    top_referers: topReferersRows.results ?? [],
+  });
+});
+
+function zeroFillDaily(rows: Array<{ day: string; count: number }>, days: number): Array<{ day: string; count: number }> {
+  const have = new Map(rows.map((r) => [r.day, r.count]));
+  const out: Array<{ day: string; count: number }> = [];
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(today);
+    d.setUTCDate(d.getUTCDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    out.push({ day: key, count: have.get(key) ?? 0 });
+  }
+  return out;
+}
+
 export default app;
 
 // Standalone handler used by the root /s/:code route in index.ts. Returns a

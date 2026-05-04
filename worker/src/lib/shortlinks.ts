@@ -17,6 +17,24 @@ export function generateShortCode(): string {
   return out;
 }
 
+// Custom-alias validator. Stricter than the auto-mint charset because aliases
+// are user-typed and need to survive being shouted across a room (no homoglyph
+// risk from `_` vs `-` vs space). 3-32 chars, alphanumerics + hyphen +
+// underscore. Reject pure-numeric to avoid collisions with potential future
+// `/s/<id>` shortcuts.
+const ALIAS_RE = /^[A-Za-z0-9_-]{3,32}$/;
+
+export interface AliasValidation {
+  ok: boolean;
+  reason?: 'invalid_format' | 'numeric_only';
+}
+
+export function validateAlias(raw: string): AliasValidation {
+  if (!ALIAS_RE.test(raw)) return { ok: false, reason: 'invalid_format' };
+  if (/^\d+$/.test(raw)) return { ok: false, reason: 'numeric_only' };
+  return { ok: true };
+}
+
 // Idempotent. Returns the existing code on a row that already has one — the
 // extension's "Shorten & copy" button is allowed to re-trigger this without
 // minting fresh codes. Collisions on the UNIQUE index are retried a few
