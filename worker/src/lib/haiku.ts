@@ -206,6 +206,7 @@ export interface ChatContext {
   title: string | null;
   url: string;
   summary: string | null;
+  excerpt: string | null;
   tags: string[];
 }
 
@@ -240,7 +241,10 @@ function formatChatMessage(question: string, context: ChatContext[]): string {
   const blocks = context.map((c) => {
     const tags = c.tags.length ? `\nTags: ${c.tags.join(', ')}` : '';
     const summary = c.summary ? `\nSummary: ${c.summary}` : '';
-    return `[#${c.id}] ${c.title ?? c.url}\nURL: ${c.url}${tags}${summary}`;
+    // The stored excerpt (≤3000 chars) lets answers go past what a 1-2
+    // sentence summary says. X posts store the same text as both — skip it.
+    const excerpt = c.excerpt && c.excerpt !== c.summary ? `\nExcerpt: ${c.excerpt}` : '';
+    return `[#${c.id}] ${c.title ?? c.url}\nURL: ${c.url}${tags}${summary}${excerpt}`;
   });
   return `Question: ${question}\n\nContext bookmarks:\n${blocks.join('\n\n')}`;
 }
