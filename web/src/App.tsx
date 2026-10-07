@@ -2025,6 +2025,8 @@ function BookmarkCard({
   b, categories, onReenriched, onUpdate, onDelete, onToggleWatched,
 }: { b: Bookmark } & CardHandlers) {
   const [busy, setBusy] = useState(false);
+  const [oracleBusy, setOracleBusy] = useState(false);
+  const [oracleHint, setOracleHint] = useState<string | null>(null);
   const [shortCode, setShortCode] = useState<string | null>(b.short_code);
   const [copyHint, setCopyHint] = useState<string | null>(null);
   const [statsOpen, setStatsOpen] = useState(false);
@@ -2067,6 +2069,29 @@ function BookmarkCard({
       // swallow — button just stops spinning
     }
     setTimeout(async () => { await onReenriched(b.id); setBusy(false); }, 3500);
+  };
+
+  // "Call the Oracle": opt-in Haiku summary. Synchronous unlike re-enrich, so
+  // we can show the new summary immediately by refetching the row on success.
+  // Errors get a brief inline hint rather than a global toast — the user is
+  // standing right there clicking the button.
+  const callOracle = async () => {
+    setOracleBusy(true);
+    setOracleHint(null);
+    try {
+      const r = await fetch(`/api/bookmarks/${b.id}/detailed-summary`, { method: 'POST' });
+      if (!r.ok) {
+        const msg = await r.json().catch(() => null) as { error?: string } | null;
+        throw new Error(msg?.error ?? `HTTP ${r.status}`);
+      }
+      await onReenriched(b.id);
+      setOracleHint('Oracle ✓');
+    } catch (err) {
+      setOracleHint((err as Error).message || 'Oracle failed');
+    } finally {
+      setOracleBusy(false);
+      setTimeout(() => setOracleHint(null), 2500);
+    }
   };
 
   const cycleImportance = () => {
@@ -2189,6 +2214,18 @@ function BookmarkCard({
             </svg>
           </a>
         )}
+        {b.ai_summary && (
+          <button
+            className="icon-btn oracle-btn"
+            onClick={callOracle}
+            disabled={oracleBusy}
+            title="Call the Oracle: regenerate this summary with Haiku"
+            aria-label="Call the Oracle"
+          >
+            {oracleBusy ? '…' : '🔮'}
+          </button>
+        )}
+        {oracleHint && <span className="copy-hint" role="status">{oracleHint}</span>}
         <button
           className="icon-btn reenrich-btn"
           onClick={reenrich}

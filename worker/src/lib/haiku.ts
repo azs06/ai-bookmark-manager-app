@@ -9,13 +9,36 @@ import {
 
 export type { SummaryResult } from './prompts';
 
-export async function summarizeAndTag(
-  env: Env,
-  input: SummarizeInput,
-): Promise<SummaryResult> {
-  if (!env.ANTHROPIC_API_KEY) {
-    throw new Error('ANTHROPIC_API_KEY is not configured');
+// Haiku 5.5 thinks by default (adaptive) and thinking counts toward
+// max_tokens, so caps leave headroom above the expected answer length.
+const HAIKU_MODEL = 'claude-haiku-5-5';
+
+// 'low' is the cheap automatic tier; explicit user actions (the Oracle) can
+// ask for more. Haiku 5.5's API default is 'medium', so always send it.
+export type HaikuEffort = 'low' | 'medium' | 'high';
+
+// Haiku 5.5 runs safety classifiers that can decline a request (HTTP 200,
+// stop_reason "refusal"). There's no server-side fallback for this model, so
+// callers decide how to surface it. The message is user-readable on purpose:
+// routes pass err.message straight through to the UI.
+export class HaikuRefusalError extends Error {
+  constructor(readonly category: string | null) {
+    super(`Claude declined this request${category ? ` (category: ${category})` : ''}.`);
+    this.name = 'HaikuRefusalError';
   }
+}
+
+interface MessagesResponse {
+  stop_reason: string | null;
+  stop_details?: { category?: string | null } | null;
+  content: Array<{ type: string; text?: string }>;
+}
+
+async function callHaiku(
+  env: Env,
+  req: { system: string; user: string; maxTokens: number; effort: HaikuEffort },
+): Promise<string> {
+  if (!env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not configured');
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -25,21 +48,42 @@ export async function summarizeAndTag(
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-haiku-4-5',
-      max_tokens: 400,
-      system: pickSystemPrompt(input.kind),
-      messages: [{ role: 'user', content: buildSummarizeUserMessage(input) }],
+      model: HAIKU_MODEL,
+      max_tokens: req.maxTokens,
+      output_config: { effort: req.effort },
+      system: req.system,
+      messages: [{ role: 'user', content: req.user }],
     }),
   });
 
-  if (!resp.ok) {
-    throw new Error(`anthropic ${resp.status}: ${await resp.text()}`);
-  }
+  if (!resp.ok) throw new Error(`anthropic ${resp.status}: ${await resp.text()}`);
+  return readText((await resp.json()) as MessagesResponse);
+}
 
-  const data = (await resp.json()) as {
-    content: Array<{ type: string; text?: string }>;
-  };
-  const text = data.content.find((c) => c.type === 'text')?.text ?? '';
+// Responses can lead with thinking blocks, so pick the text block by type.
+// A response that hit max_tokens is incomplete (truncated JSON, cut-off chat
+// answer) — fail loudly rather than hand callers a partial string.
+function readText(data: MessagesResponse): string {
+  if (data.stop_reason === 'refusal') {
+    throw new HaikuRefusalError(data.stop_details?.category ?? null);
+  }
+  if (data.stop_reason === 'max_tokens') {
+    throw new Error('anthropic response hit max_tokens before finishing');
+  }
+  return data.content.find((c) => c.type === 'text')?.text ?? '';
+}
+
+export async function summarizeAndTag(
+  env: Env,
+  input: SummarizeInput,
+  opts: { effort?: HaikuEffort } = {},
+): Promise<SummaryResult> {
+  const text = await callHaiku(env, {
+    system: pickSystemPrompt(input.kind),
+    user: buildSummarizeUserMessage(input),
+    maxTokens: 1024,
+    effort: opts.effort ?? 'low',
+  });
   return parseSummarizeTagJson(text);
 }
 
@@ -72,24 +116,12 @@ export async function suggestTopPicks(
 ): Promise<Pick[]> {
   if (!env.ANTHROPIC_API_KEY || !candidates.length) return [];
 
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5',
-      max_tokens: 600,
-      system: PICK_SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: formatCandidates(candidates) }],
-    }),
+  const text = await callHaiku(env, {
+    system: PICK_SYSTEM_PROMPT,
+    user: formatCandidates(candidates),
+    maxTokens: 1024,
+    effort: 'low',
   });
-
-  if (!resp.ok) throw new Error(`anthropic ${resp.status}: ${await resp.text()}`);
-  const data = (await resp.json()) as { content: Array<{ type: string; text?: string }> };
-  const text = data.content.find((c) => c.type === 'text')?.text ?? '';
   return parsePicks(text, new Set(candidates.map((c) => c.id)));
 }
 
@@ -147,28 +179,13 @@ export async function answerWithContext(
   question: string,
   context: ChatContext[],
 ): Promise<ChatAnswer> {
-  if (!env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not configured');
-
-  const userMessage = formatChatMessage(question, context);
-
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5',
-      max_tokens: 800,
-      system: CHAT_SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userMessage }],
-    }),
+  const text = await callHaiku(env, {
+    system: CHAT_SYSTEM_PROMPT,
+    user: formatChatMessage(question, context),
+    maxTokens: 2048,
+    effort: 'low',
   });
-
-  if (!resp.ok) throw new Error(`anthropic ${resp.status}: ${await resp.text()}`);
-  const data = (await resp.json()) as { content: Array<{ type: string; text?: string }> };
-  const answer = data.content.find((c) => c.type === 'text')?.text?.trim() ?? '';
+  const answer = text.trim();
   return { answer, citedIds: extractCitations(answer, context) };
 }
 
