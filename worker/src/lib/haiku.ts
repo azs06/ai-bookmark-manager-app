@@ -36,7 +36,15 @@ interface MessagesResponse {
 
 async function callHaiku(
   env: Env,
-  req: { system: string; user: string; maxTokens: number; effort: HaikuEffort },
+  req: {
+    system: string;
+    user: string;
+    maxTokens: number;
+    effort: HaikuEffort;
+    // Structured outputs: the API guarantees the reply parses against this
+    // schema, so JSON routes can't come back as prose or half-fenced JSON.
+    schema?: Record<string, unknown>;
+  },
 ): Promise<string> {
   if (!env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not configured');
 
@@ -50,7 +58,10 @@ async function callHaiku(
     body: JSON.stringify({
       model: HAIKU_MODEL,
       max_tokens: req.maxTokens,
-      output_config: { effort: req.effort },
+      output_config: {
+        effort: req.effort,
+        ...(req.schema && { format: { type: 'json_schema', schema: req.schema } }),
+      },
       system: req.system,
       messages: [{ role: 'user', content: req.user }],
     }),
@@ -63,6 +74,7 @@ async function callHaiku(
 // Responses can lead with thinking blocks, so pick the text block by type.
 // A response that hit max_tokens is incomplete (truncated JSON, cut-off chat
 // answer) — fail loudly rather than hand callers a partial string.
+// These are also the two cases where structured output may not match the schema.
 function readText(data: MessagesResponse): string {
   if (data.stop_reason === 'refusal') {
     throw new HaikuRefusalError(data.stop_details?.category ?? null);
@@ -72,6 +84,36 @@ function readText(data: MessagesResponse): string {
   }
   return data.content.find((c) => c.type === 'text')?.text ?? '';
 }
+
+// Structured-output schemas: every object needs additionalProperties: false,
+// and length/count constraints (minItems, maxLength…) aren't supported — the
+// prompts carry those rules instead.
+const SUMMARY_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    tags: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['summary', 'tags'],
+  additionalProperties: false,
+};
+
+const PICKS_SCHEMA = {
+  type: 'object',
+  properties: {
+    picks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { id: { type: 'integer' }, reason: { type: 'string' } },
+        required: ['id', 'reason'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['picks'],
+  additionalProperties: false,
+};
 
 export async function summarizeAndTag(
   env: Env,
@@ -83,6 +125,7 @@ export async function summarizeAndTag(
     user: buildSummarizeUserMessage(input),
     maxTokens: 1024,
     effort: opts.effort ?? 'low',
+    schema: SUMMARY_SCHEMA,
   });
   return parseSummarizeTagJson(text);
 }
@@ -121,6 +164,7 @@ export async function suggestTopPicks(
     user: formatCandidates(candidates),
     maxTokens: 1024,
     effort: 'low',
+    schema: PICKS_SCHEMA,
   });
   return parsePicks(text, new Set(candidates.map((c) => c.id)));
 }
