@@ -7,7 +7,7 @@ import { detectReddit, fetchRedditPost, type RedditPostData } from '../lib/reddi
 import { probeUrl } from '../lib/health';
 import { assignShortCode, buildShortUrl, generateShortCode, validateAlias } from '../lib/shortlinks';
 import { createOrRestoreBookmark } from '../lib/createBookmark';
-import { summarizeAndTag } from '../lib/haiku';
+import { HaikuRefusalError, summarizeAndTag } from '../lib/haiku';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -536,30 +536,37 @@ app.post('/import', async (c) => {
   return c.json({ imported, skipped, errors });
 });
 
-// "Call the Oracle": user-triggered Haiku summary upgrade. Whatever's in
-// ai_summary today (on-device, gemma, or stale Haiku) gets replaced with a
-// fresh Haiku pass over the same excerpt. Synchronous so the UI shows the
-// new summary immediately. Charges fall on the user's request, not the
-// auto-enrichment path — the whole point of this route is opt-in cost.
+// "Call the Oracle": user-triggered detailed summary. Whatever's in
+// ai_summary today gets replaced with a longer Haiku summary at higher
+// effort, over the full page text (cached markdown, fetched and cached on a
+// miss) rather than the 3000-char excerpt the automatic tier sees. Videos and
+// X posts have no markdown, so they still use the stored excerpt/transcript.
+// Synchronous so the UI shows the new summary immediately.
+const ORACLE_MAX_CHARS = 40_000;  // ~13K tokens; ≈$0.001 per click
+
 app.post('/:id{[0-9]+}/detailed-summary', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
 
   const row = await c.env.DB
     .prepare(`
-      SELECT id, title, content_excerpt, content_type, metadata
+      SELECT id, url, title, content_excerpt, content_type, metadata, markdown_cached
       FROM bookmarks WHERE id = ?
     `)
     .bind(id)
     .first<{
       id: number;
+      url: string;
       title: string | null;
       content_excerpt: string | null;
       content_type: string | null;
       metadata: string;
+      markdown_cached: string | null;
     }>();
   if (!row) return c.json({ error: 'not found' }, 404);
-  if (!row.content_excerpt) {
+
+  const sourceText = await loadOracleText(c.env, row);
+  if (!sourceText) {
     return c.json({
       error: 'No extracted content yet — try Re-enrich first, then call the Oracle.',
     }, 400);
@@ -569,10 +576,12 @@ app.post('/:id{[0-9]+}/detailed-summary', async (c) => {
   try {
     result = await summarizeAndTag(c.env, {
       title: row.title ?? undefined,
-      excerpt: row.content_excerpt,
+      excerpt: sourceText.slice(0, ORACLE_MAX_CHARS),
       kind: row.content_type === 'video' ? 'video' : 'article',
+      detail: 'detailed',
     }, { effort: 'medium' });  // explicit click: worth more than the auto tier's 'low'
   } catch (err) {
+    if (err instanceof HaikuRefusalError) console.warn('oracle:haiku-refusal', err.category);
     return c.json({ error: (err as Error).message }, 502);
   }
 
@@ -609,6 +618,36 @@ app.post('/:id{[0-9]+}/detailed-summary', async (c) => {
     summary_at: now,
   });
 });
+
+// Full page text for the Oracle: cached markdown, else fetch-and-cache it the
+// same way the markdown route does, else the stored excerpt. A Jina/origin
+// failure must not fail the Oracle, so every miss falls through.
+async function loadOracleText(
+  env: Env,
+  row: { id: number; url: string; content_type: string | null; content_excerpt: string | null; markdown_cached: string | null },
+): Promise<string | null> {
+  if (row.content_type === 'video' || row.content_type === 'x') return row.content_excerpt;
+  if (row.markdown_cached) return row.markdown_cached;
+
+  try {
+    const result = await fetchMarkdown(row.url);
+    if (result.ok) {
+      const now = Date.now();
+      await env.DB
+        .prepare(`
+          UPDATE bookmarks
+          SET markdown_cached = ?, markdown_cached_at = ?, markdown_source = ?, updated_at = ?
+          WHERE id = ?
+        `)
+        .bind(result.markdown, now, result.source, now, row.id)
+        .run();
+      return result.markdown;
+    }
+  } catch (err) {
+    console.warn('oracle:markdown-fetch-failed', err);
+  }
+  return row.content_excerpt;
+}
 
 // Records that the user opened the bookmark (card link or reader). Feeds the
 // daily picks' "long-unopened" signal. Deliberately leaves updated_at alone:

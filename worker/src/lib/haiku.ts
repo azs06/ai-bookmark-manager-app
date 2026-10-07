@@ -121,9 +121,10 @@ export async function summarizeAndTag(
   opts: { effort?: HaikuEffort } = {},
 ): Promise<SummaryResult> {
   const text = await callHaiku(env, {
-    system: pickSystemPrompt(input.kind),
+    system: pickSystemPrompt(input.kind, input.detail),
     user: buildSummarizeUserMessage(input),
-    maxTokens: 1024,
+    // Detailed runs think more (Oracle uses 'medium') and write more.
+    maxTokens: input.detail === 'detailed' ? 2048 : 1024,
     effort: opts.effort ?? 'low',
     schema: SUMMARY_SCHEMA,
   });
