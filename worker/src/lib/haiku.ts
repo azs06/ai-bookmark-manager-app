@@ -141,11 +141,12 @@ export interface PickCandidate {
   tags: string[];
   importance: number;
   age_days: number;
+  days_since_viewed: number | null;  // null = no recorded open
 }
 
 export interface Pick { id: number; reason: string; }
 
-const PICK_SYSTEM_PROMPT = `You curate a daily shortlist from a personal bookmark library. From the candidates given, pick 3-5 that the user is most likely to act on today — balance long-unopened but high-importance items with recent saves they likely want to revisit. Return STRICT JSON only:
+const PICK_SYSTEM_PROMPT = `You curate a daily shortlist from a personal bookmark library. From the candidates given, pick 3-5 that the user is most likely to act on today — balance long-unopened but high-importance items with recent saves they likely want to revisit. Each candidate shows how old it is and when it was last opened. Open tracking started recently, so "never opened" on an older save is weak evidence — weigh it lightly. Return STRICT JSON only:
 {"picks": [{"id": 123, "reason": "one-sentence reason, max 15 words"}]}
 
 Rules:
@@ -174,7 +175,8 @@ function formatCandidates(candidates: PickCandidate[]): string {
     const importanceLabel = c.importance === 2 ? 'pinned' : c.importance === 1 ? 'important' : 'normal';
     const tags = c.tags.length ? ` tags=[${c.tags.join(', ')}]` : '';
     const summary = c.summary ? ` — ${c.summary}` : '';
-    return `#${c.id} (${importanceLabel}, ${c.age_days}d old)${tags}: ${c.title ?? '(no title)'}${summary}`;
+    const viewed = c.days_since_viewed === null ? 'never opened' : `opened ${c.days_since_viewed}d ago`;
+    return `#${c.id} (${importanceLabel}, ${c.age_days}d old, ${viewed})${tags}: ${c.title ?? '(no title)'}${summary}`;
   });
   return `Candidates:\n${lines.join('\n')}`;
 }

@@ -1829,6 +1829,13 @@ marked.use({
   },
 });
 
+// Records an open so daily picks can tell "long-unopened" from "just read".
+// Fire-and-forget: keepalive lets the request outlive a click that opens a
+// new tab, and a failure only costs one data point.
+function markViewed(id: number) {
+  void fetch(`/api/bookmarks/${id}/viewed`, { method: 'POST', keepalive: true }).catch(() => {});
+}
+
 function ReaderView({ bookmarkId }: { bookmarkId: number }) {
   const [bookmark, setBookmark] = useState<ReaderBookmark | null>(null);
   const [state, setState] = useState<FetchState>({ phase: 'loading' });
@@ -1837,6 +1844,8 @@ function ReaderView({ bookmarkId }: { bookmarkId: number }) {
   useEffect(() => {
     document.title = 'Reader — AI Bookmarks';
   }, []);
+
+  useEffect(() => { markViewed(bookmarkId); }, [bookmarkId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2121,7 +2130,14 @@ function BookmarkCard({
   return (
     <div className={`bookmark${pinnedClass}${videoClass}${xPostClass}${watchedClass}`}>
       {b.og_image_url && (
-        <a href={b.url} target="_blank" rel="noreferrer" className="bookmark-thumb">
+        <a
+          href={b.url}
+          target="_blank"
+          rel="noreferrer"
+          className="bookmark-thumb"
+          onClick={() => markViewed(b.id)}
+          onAuxClick={() => markViewed(b.id)}
+        >
           <img src={b.og_image_url} alt="" />
           {isVideo && <span className="play-overlay" aria-hidden>▶</span>}
           {isXPost && <span className="play-overlay" aria-hidden>𝕏</span>}
@@ -2129,7 +2145,16 @@ function BookmarkCard({
         </a>
       )}
       <div className="bookmark-body">
-        <a href={b.url} target="_blank" rel="noreferrer" className="title">{b.title ?? b.url}</a>
+        <a
+          href={b.url}
+          target="_blank"
+          rel="noreferrer"
+          className="title"
+          onClick={() => markViewed(b.id)}
+          onAuxClick={() => markViewed(b.id)}
+        >
+          {b.title ?? b.url}
+        </a>
         <div className="domain">
           {xPost?.handle ? (
             <span className="channel">@{xPost.handle}</span>

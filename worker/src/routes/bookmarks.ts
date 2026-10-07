@@ -610,6 +610,18 @@ app.post('/:id{[0-9]+}/detailed-summary', async (c) => {
   });
 });
 
+// Records that the user opened the bookmark (card link or reader). Feeds the
+// daily picks' "long-unopened" signal. Deliberately leaves updated_at alone:
+// opening isn't an edit and shouldn't reorder anything sorted by it.
+app.post('/:id{[0-9]+}/viewed', async (c) => {
+  const id = Number(c.req.param('id'));
+  await c.env.DB
+    .prepare('UPDATE bookmarks SET last_viewed_at = ? WHERE id = ?')
+    .bind(Date.now(), id)
+    .run();
+  return c.json({ ok: true });
+});
+
 app.post('/:id/re-enrich', async (c) => {
   const id = Number(c.req.param('id'));
   if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
