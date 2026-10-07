@@ -1,5 +1,5 @@
 import type { Env } from '../types';
-import { summarizeAndTag } from './haiku';
+import { HaikuRefusalError, summarizeAndTag } from './haiku';
 import { summarizeAndTagGemma } from './gemma';
 import { embedAndUpsert } from './vector';
 import type { SummarizeInput, SummaryResult } from './prompts';
@@ -57,8 +57,8 @@ export async function enrich(
 
     // On-device summary takes precedence on this first pass: the user already
     // saw it in the popup, so we keep it as the displayed summary and take only
-    // Gemma's tags + extract metadata. (Gemma still ran above — we run it for
-    // the tags and discard its summary; the saving is on the later re-enrich
+    // the AI tier's tags + extract metadata. (The model still ran above — we run
+    // it for the tags and discard its summary; the saving is on the later re-enrich
     // path, which preserves nothing and would otherwise re-summarize.)
     const finalSummary = preserveClientSummary ? row.ai_summary : summary;
     const finalSource = preserveClientSummary
@@ -335,37 +335,41 @@ async function extractPage(url: string): Promise<ExtractedPage> {
   };
 }
 
-// Gemma is ~10× cheaper than Haiku and handles the vast majority of pages
-// fine. When it can't parse or the AI binding errors, fall back to Haiku so
-// the bookmark still gets enriched. Log each branch so fallback rate is
-// observable in `wrangler tail`.
+// Haiku first: summaries feed the search embeddings, Haiku 5.5 follows the
+// prompt more reliably than Gemma with thinking off, structured outputs rule
+// out parse failures, and it costs ~$0.0003 per bookmark. Gemma is the
+// fallback when Haiku errors, refuses, or no API key is configured.
+//
+// A Haiku junk verdict ({summary: '', tags: []}) is accepted, not retried on
+// Gemma: the prompt asks for it on paywalls and error pages, so a retry would
+// only summarize the junk. Log each branch so the mix shows in `wrangler tail`.
 async function summarizeWithFallback(
   env: Env,
   input: SummarizeInput,
-): Promise<{ result: SummaryResult; source: 'gemma' | 'haiku-auto' } | null> {
+): Promise<{ result: SummaryResult; source: 'haiku-auto' | 'gemma' } | null> {
+  if (env.ANTHROPIC_API_KEY) {
+    try {
+      const haiku = await summarizeAndTag(env, input);
+      console.log('enrich:haiku-hit');
+      return { result: haiku, source: 'haiku-auto' };
+    } catch (err) {
+      if (err instanceof HaikuRefusalError) console.warn('enrich:haiku-refusal', err.category);
+      else console.error('haiku failed', err);
+    }
+  }
+
   try {
     const gemma = await summarizeAndTagGemma(env, input);
     if (gemma) {
-      console.log('enrich:gemma-hit');
+      console.log('enrich:gemma-fallback');
       return { result: gemma, source: 'gemma' };
     }
   } catch (err) {
     console.error('gemma failed', err);
   }
 
-  if (!env.ANTHROPIC_API_KEY) {
-    console.error('enrich:both-failed (no ANTHROPIC_API_KEY for Haiku fallback)');
-    return null;
-  }
-
-  try {
-    const haiku = await summarizeAndTag(env, input);
-    console.log('enrich:haiku-fallback');
-    return { result: haiku, source: 'haiku-auto' };
-  } catch (err) {
-    console.error('enrich:both-failed', err);
-    return null;
-  }
+  console.error('enrich:both-failed');
+  return null;
 }
 
 // enrich() rebuilds metadata from the extract pass; this stamps the
