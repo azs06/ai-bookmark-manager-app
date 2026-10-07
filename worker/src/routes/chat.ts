@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { Env } from '../types';
 import { embedQuery } from '../lib/vector';
-import { answerWithContext, type ChatContext } from '../lib/haiku';
+import { answerWithContext, HaikuRefusalError, type ChatContext } from '../lib/haiku';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -42,6 +42,8 @@ app.post('/', async (c) => {
     const sources = rows.filter((r) => citedIds.includes(r.id));
     return c.json({ answer, sources, question });
   } catch (e) {
+    // A refusal is the model declining this question, not a server fault.
+    if (e instanceof HaikuRefusalError) return c.json({ error: e.message }, 422);
     return c.json({ error: (e as Error).message }, 500);
   }
 });
