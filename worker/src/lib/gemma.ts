@@ -19,7 +19,8 @@ const MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const MAX_OUTPUT_TOKENS = 400;
 
 // Returns null when Gemma is unavailable (no AI binding) or produced
-// unparseable output. Callers should fall back to Haiku on null. Each
+// unparseable output. Gemma is the fallback tier, so null means enrichment
+// has no summary for this pass. Each
 // null-return path logs its cause so fallback-rate diagnosis doesn't
 // require flipping to a debugger.
 export async function summarizeAndTagGemma(
@@ -57,7 +58,7 @@ export async function summarizeAndTagGemma(
   const parsed = parseSummarizeTagJson(text);
   // Empty summary + empty tags is a legitimate "junk page" signal from the
   // prompt. But if Gemma returned non-empty text that failed to parse into
-  // either field, treat it as a miss so we fall back to Haiku.
+  // either field, treat it as a miss.
   if (!parsed.summary && !parsed.tags.length) {
     console.warn('gemma: parse failure, output head:', text.slice(0, 200));
     return null;

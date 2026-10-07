@@ -13,6 +13,7 @@ interface ContextRow {
   url: string;
   title: string | null;
   ai_summary: string | null;
+  content_excerpt: string | null;
   ai_tags: string;
   importance: number;
   created_at: number;
@@ -33,17 +34,24 @@ app.post('/', async (c) => {
     title: row.title,
     url: row.url,
     summary: row.ai_summary,
+    excerpt: row.content_excerpt,
     tags: safeTags(row.ai_tags),
   }));
 
   try {
     const { answer, citedIds } = await answerWithContext(c.env, question, context);
     // Expose just the cited rows as "sources" — the UI surfaces these as linked cards.
-    const sources = rows.filter((r) => citedIds.includes(r.id));
+    // Excerpts were model context only; keep the response payload small.
+    const sources = rows
+      .filter((r) => citedIds.includes(r.id))
+      .map(({ content_excerpt: _excerpt, ...rest }) => rest);
     return c.json({ answer, sources, question });
   } catch (e) {
     // A refusal is the model declining this question, not a server fault.
-    if (e instanceof HaikuRefusalError) return c.json({ error: e.message }, 422);
+    if (e instanceof HaikuRefusalError) {
+      console.warn('chat:haiku-refusal', e.category);
+      return c.json({ error: e.message }, 422);
+    }
     return c.json({ error: (e as Error).message }, 500);
   }
 });
@@ -70,7 +78,7 @@ async function gatherContext(env: Env, question: string): Promise<ContextRow[]> 
 
 async function loadRowsByIds(env: Env, ids: number[]): Promise<ContextRow[]> {
   const rows = await env.DB.prepare(`
-      SELECT id, url, title, ai_summary, ai_tags, importance, created_at
+      SELECT id, url, title, ai_summary, content_excerpt, ai_tags, importance, created_at
       FROM bookmarks
       WHERE id IN (${ids.map(() => '?').join(',')}) AND status != 'archived'
     `).bind(...ids)
@@ -90,7 +98,7 @@ async function loadFallbackRows(env: Env, excludeIds: number[], limit: number): 
     : '';
 
   const query = env.DB.prepare(`
-        SELECT id, url, title, ai_summary, ai_tags, importance, created_at
+        SELECT id, url, title, ai_summary, content_excerpt, ai_tags, importance, created_at
         FROM bookmarks
         WHERE status IN ('active', 'partial', 'imported')
         ${exclusionClause}

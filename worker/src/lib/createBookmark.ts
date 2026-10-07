@@ -22,7 +22,7 @@ export interface CreateBookmarkInput {
   note?: string;
   // Optional on-device summary from the extension. When present, it lands in
   // the row immediately so the UI shows a summary before enrich() finishes,
-  // and enrich() preserves it instead of overwriting with the Gemma summary.
+  // and enrich() preserves it instead of overwriting with the AI tier's summary.
   ai_summary?: string;
   summary_source?: 'on-device';
 }
