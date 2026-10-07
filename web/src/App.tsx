@@ -2136,7 +2136,7 @@ function BookmarkCard({
           rel="noreferrer"
           className="bookmark-thumb"
           onClick={() => markViewed(b.id)}
-          onAuxClick={() => markViewed(b.id)}
+          onAuxClick={(e) => { if (e.button === 1) markViewed(b.id); }}
         >
           <img src={b.og_image_url} alt="" />
           {isVideo && <span className="play-overlay" aria-hidden>▶</span>}
@@ -2151,7 +2151,7 @@ function BookmarkCard({
           rel="noreferrer"
           className="title"
           onClick={() => markViewed(b.id)}
-          onAuxClick={() => markViewed(b.id)}
+          onAuxClick={(e) => { if (e.button === 1) markViewed(b.id); }}
         >
           {b.title ?? b.url}
         </a>
