@@ -847,34 +847,58 @@ app.post('/:id/watched', async (c) => {
   return c.json({ ok: true, watched: body.watched, watchedAt: body.watched ? now : null });
 });
 
-// Batch-enrich bookmarks that were imported (from the Chrome extension) or
-// stuck in 'pending' (save succeeded but enrichment didn't finish). Bounded
-// per call so the client can loop and cancel; Worker stays inside subrequest
-// + CPU limits no matter how large the backlog is.
+// Batch enrichment, bounded per call so the client can loop and cancel; the
+// Worker stays inside subrequest + CPU limits no matter how large the backlog.
+//
+// Two sets:
+// - default: bookmarks imported (extension / bulk import) or stuck 'pending'.
+//   Enrichment moves them out of the set, so "loop until remaining = 0" ends.
+// - ?scope=partial: bookmarks enriched before but left without a summary.
+//   A failed retry leaves them 'partial', so this set needs a cursor: the
+//   client passes `since` (when its sweep started) and each call claims its
+//   rows by bumping updated_at, so a row is tried at most once per sweep —
+//   including rows still being processed when the next call arrives.
 const BATCH_DEFAULT = 20;
 const BATCH_MAX = 50;
 const BATCH_CONCURRENCY = 4;
+
+const BACKLOG_WHERE = `status IN ('imported', 'pending')`;
+const PARTIAL_WHERE = `status = 'partial' AND updated_at < ?`;
 
 app.post('/enrich-imported', async (c) => {
   const requested = Number(c.req.query('limit') ?? BATCH_DEFAULT);
   const limit = Math.min(Math.max(Number.isFinite(requested) ? requested : BATCH_DEFAULT, 1), BATCH_MAX);
 
+  const partial = c.req.query('scope') === 'partial';
+  const since = Number(c.req.query('since'));
+  if (partial && !Number.isFinite(since)) return c.json({ error: 'since required for scope=partial' }, 400);
+  const where = partial ? PARTIAL_WHERE : BACKLOG_WHERE;
+  const whereParams = partial ? [since] : [];
+
   const rows = await c.env.DB
     .prepare(`
       SELECT id FROM bookmarks
-      WHERE status IN ('imported', 'pending')
+      WHERE ${where}
       ORDER BY created_at DESC
       LIMIT ?
     `)
-    .bind(limit)
+    .bind(...whereParams, limit)
     .all<{ id: number }>();
 
   const ids = (rows.results ?? []).map((r) => r.id);
 
   const totalRow = await c.env.DB
-    .prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE status IN ('imported', 'pending')`)
+    .prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE ${where}`)
+    .bind(...whereParams)
     .first<{ n: number }>();
   const totalBefore = totalRow?.n ?? 0;
+
+  if (ids.length && partial) {
+    await c.env.DB
+      .prepare(`UPDATE bookmarks SET updated_at = ? WHERE id IN (${ids.map(() => '?').join(',')})`)
+      .bind(Date.now(), ...ids)
+      .run();
+  }
 
   if (ids.length) {
     c.executionCtx.waitUntil(runEnrichBatch(c.env, ids, BATCH_CONCURRENCY));
@@ -887,10 +911,11 @@ app.post('/enrich-imported', async (c) => {
 });
 
 app.get('/pending-count', async (c) => {
-  const row = await c.env.DB
-    .prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE status IN ('imported', 'pending')`)
-    .first<{ n: number }>();
-  return c.json({ pending: row?.n ?? 0 });
+  const [backlog, partial] = await Promise.all([
+    c.env.DB.prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE ${BACKLOG_WHERE}`).first<{ n: number }>(),
+    c.env.DB.prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE status = 'partial'`).first<{ n: number }>(),
+  ]);
+  return c.json({ pending: backlog?.n ?? 0, partial: partial?.n ?? 0 });
 });
 
 // URL-health scanner. Probes up to `limit` non-archived bookmarks per call;
