@@ -19,6 +19,7 @@ interface Bookmark {
   short_code: string | null;
   click_count: number;
   created_at: number;
+  last_viewed_at?: number | null;  // absent on search results and picks
 }
 
 interface VideoMetadata {
@@ -86,7 +87,6 @@ interface CategoriesPayload {
   total: number;
 }
 
-type View = 'list' | 'grid';
 type Theme = 'light' | 'dark';
 type Mode = 'bookmarks' | 'feeds' | 'shortlinks' | 'settings' | 'reader';
 type Scope = { kind: 'all' } | { kind: 'uncategorized' } | { kind: 'category'; id: number };
@@ -98,18 +98,21 @@ interface Filters {
   domain: string | null;
   year: string | null;
   contentType: 'video' | 'x' | null;
+  tag: string | null;
 }
 
 interface FacetsPayload {
   domains: { name: string; count: number }[];
   years: { year: string; count: number }[];
   contentTypes: { name: string; count: number }[];
+  tags: { name: string; count: number }[];
 }
 
-const EMPTY_FILTERS: Filters = { minImportance: 0, domain: null, year: null, contentType: null };
+const EMPTY_FILTERS: Filters = { minImportance: 0, domain: null, year: null, contentType: null, tag: null };
+const EMPTY_FACETS: FacetsPayload = { domains: [], years: [], contentTypes: [], tags: [] };
 
 function isFilterActive(f: Filters): boolean {
-  return f.minImportance !== 0 || f.domain !== null || f.year !== null || f.contentType !== null;
+  return f.minImportance !== 0 || f.domain !== null || f.year !== null || f.contentType !== null || f.tag !== null;
 }
 
 interface CategoryNode extends CategoryRow {
@@ -121,7 +124,6 @@ interface CategoryNode extends CategoryRow {
 
 const PAGE_SIZE = 25;
 const THEME_KEY = 'bm:theme';
-const SIDEBAR_KEY = 'bm:sidebar-open';
 const EXPANDED_KEY = 'bm:expanded-cats';
 const PICKS_COLLAPSED_KEY = 'bm:picks-collapsed';
 
@@ -170,13 +172,14 @@ function buildTree(rows: CategoryRow[]): { roots: CategoryNode[]; byId: Map<numb
 //   /bookmarks                       → all bookmarks
 //   /bookmarks?category=uncategorized → uncategorized
 //   /bookmarks?category=N            → specific category
+//   /bookmarks?tag=rust              → filtered to a tag (combinable with category)
 //   /feeds                           → feeds
 //   /feeds?feed_id=N                 → feeds, pre-filtered (read once by FeedsView)
 //   /settings                        → app-level maintenance tools (URL health, …)
 //
 // Legacy read-only support: /?view=feeds[&feed_id=N] is still parsed so old
 // extension links and shared URLs keep working. We never write that shape.
-interface UrlState { mode: Mode; scope: Scope; feedId: number | null; readerId: number | null }
+interface UrlState { mode: Mode; scope: Scope; tag: string | null; feedId: number | null; readerId: number | null }
 
 function parseCategoryParam(raw: string | null): Scope {
   if (raw === 'uncategorized') return { kind: 'uncategorized' };
@@ -193,38 +196,47 @@ function readUrlState(): UrlState {
     const p = new URLSearchParams(window.location.search);
     const readerMatch = path.match(READER_PATH_RE);
     if (readerMatch) {
-      return { mode: 'reader', scope: { kind: 'all' }, feedId: null, readerId: Number(readerMatch[1]) };
+      return { mode: 'reader', scope: { kind: 'all' }, tag: null, feedId: null, readerId: Number(readerMatch[1]) };
     }
     if (path === '/settings') {
-      return { mode: 'settings', scope: { kind: 'all' }, feedId: null, readerId: null };
+      return { mode: 'settings', scope: { kind: 'all' }, tag: null, feedId: null, readerId: null };
     }
     if (path === '/shortlinks') {
-      return { mode: 'shortlinks', scope: { kind: 'all' }, feedId: null, readerId: null };
+      return { mode: 'shortlinks', scope: { kind: 'all' }, tag: null, feedId: null, readerId: null };
     }
     if (path === '/feeds' || p.get('view') === 'feeds') {
       const raw = p.get('feed_id');
       const feedId = raw && Number.isFinite(Number(raw)) ? Number(raw) : null;
-      return { mode: 'feeds', scope: { kind: 'all' }, feedId, readerId: null };
+      return { mode: 'feeds', scope: { kind: 'all' }, tag: null, feedId, readerId: null };
     }
-    return { mode: 'bookmarks', scope: parseCategoryParam(p.get('category')), feedId: null, readerId: null };
+    return {
+      mode: 'bookmarks',
+      scope: parseCategoryParam(p.get('category')),
+      tag: p.get('tag') || null,
+      feedId: null,
+      readerId: null,
+    };
   } catch {
-    return { mode: 'bookmarks', scope: { kind: 'all' }, feedId: null, readerId: null };
+    return { mode: 'bookmarks', scope: { kind: 'all' }, tag: null, feedId: null, readerId: null };
   }
 }
 
 // Build the full path + query for a given state. feed_id is owned by FeedsView
 // (not tracked in App state), so preserve it verbatim when we're already on
 // /feeds and writing another feeds URL.
-function buildUrl(mode: Mode, scope: Scope): string {
+function buildUrl(mode: Mode, scope: Scope, tag: string | null): string {
   if (mode === 'settings') return '/settings';
   if (mode === 'shortlinks') return '/shortlinks';
   if (mode === 'feeds') {
     const existing = new URLSearchParams(window.location.search).get('feed_id');
     return existing ? `/feeds?feed_id=${encodeURIComponent(existing)}` : '/feeds';
   }
-  if (scope.kind === 'uncategorized') return '/bookmarks?category=uncategorized';
-  if (scope.kind === 'category') return `/bookmarks?category=${scope.id}`;
-  return '/bookmarks';
+  const p = new URLSearchParams();
+  if (scope.kind === 'uncategorized') p.set('category', 'uncategorized');
+  if (scope.kind === 'category') p.set('category', String(scope.id));
+  if (tag) p.set('tag', tag);
+  const qs = p.toString();
+  return qs ? `/bookmarks?${qs}` : '/bookmarks';
 }
 
 const INITIAL_URL_STATE = readUrlState();
@@ -242,10 +254,11 @@ export default function App() {
 
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [mode, setMode] = useState<Mode>(INITIAL_URL_STATE.mode);
-  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
-    const saved = localStorage.getItem(SIDEBAR_KEY);
-    return saved === null ? true : saved === '1';
-  });
+  // Narrow screens only: the sidebar (collections, tags) is a panel the user
+  // opens. On wide screens it's always visible and this flag is ignored.
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const shellRef = useRef<HTMLDivElement>(null);
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null);
 
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [total, setTotal] = useState(0);
@@ -256,15 +269,23 @@ export default function App() {
   const [uncategorizedCount, setUncategorizedCount] = useState(0);
   const [libraryTotal, setLibraryTotal] = useState(0);
 
-  const [view, setView] = useState<View>('list');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Bookmark[] | null>(null);
   const [searching, setSearching] = useState(false);
+  // Set when the user presses Enter in the search box: the same text goes to
+  // the library chat. Typing alone only searches. `id` changes on every
+  // submission so asking the same question again (e.g. after an error)
+  // starts a fresh request instead of reusing the mounted panel.
+  const [ask, setAsk] = useState<{ text: string; id: number } | null>(null);
+  const askQuestion = useCallback((text: string) => {
+    setMode('bookmarks');
+    setAsk((prev) => ({ text, id: (prev?.id ?? 0) + 1 }));
+  }, []);
 
-  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
-  const [facets, setFacets] = useState<FacetsPayload>({ domains: [], years: [], contentTypes: [] });
+  const [filters, setFilters] = useState<Filters>({ ...EMPTY_FILTERS, tag: INITIAL_URL_STATE.tag });
+  const [facets, setFacets] = useState<FacetsPayload>(EMPTY_FACETS);
 
   // Guards against reload / close while an optimistic write is still in flight.
   // The ref is authoritative (avoids setState-batching races); the boolean state
@@ -300,24 +321,20 @@ export default function App() {
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
-  useEffect(() => {
-    localStorage.setItem(SIDEBAR_KEY, sidebarOpen ? '1' : '0');
-  }, [sidebarOpen]);
-
   // Keep the URL in sync with mode/scope. On the first run we `replace` so
   // normalizations (e.g. `/` → `/bookmarks`, or a legacy `?view=feeds` link
   // arriving from the extension → `/feeds`) don't leave a useless back-button
   // entry. Subsequent runs `push` so each sidebar click is a real history step.
   const didMountUrl = useRef(false);
   useEffect(() => {
-    const next = buildUrl(mode, scope);
+    const next = buildUrl(mode, scope, filters.tag);
     const current = `${window.location.pathname}${window.location.search}`;
     if (next !== current) {
       const method = didMountUrl.current ? 'pushState' : 'replaceState';
       window.history[method]({}, '', next);
     }
     didMountUrl.current = true;
-  }, [mode, scope]);
+  }, [mode, scope, filters.tag]);
 
   // Browser back/forward: re-derive state from the URL.
   useEffect(() => {
@@ -326,7 +343,7 @@ export default function App() {
       setMode(s.mode);
       setScope(s.scope);
       setPage(0);
-      setFilters(EMPTY_FILTERS);
+      setFilters({ ...EMPTY_FILTERS, tag: s.tag });
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
@@ -357,6 +374,7 @@ export default function App() {
       if (nextFilters.domain) params.set('domain', nextFilters.domain);
       if (nextFilters.year) params.set('year', nextFilters.year);
       if (nextFilters.contentType) params.set('content_type', nextFilters.contentType);
+      if (nextFilters.tag) params.set('tag', nextFilters.tag);
       const r = await fetch(`/api/bookmarks?${params}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = (await r.json()) as { bookmarks: Bookmark[]; total: number };
@@ -378,11 +396,13 @@ export default function App() {
         domains?: FacetsPayload['domains'];
         years?: FacetsPayload['years'];
         content_types?: FacetsPayload['contentTypes'];
+        tags?: FacetsPayload['tags'];
       };
       setFacets({
         domains: d.domains ?? [],
         years: d.years ?? [],
         contentTypes: d.content_types ?? [],
+        tags: d.tags ?? [],
       });
     } catch {
       // Filter bar degrades to empty selects — list still works.
@@ -539,177 +559,214 @@ export default function App() {
   const rest = bookmarks.filter((b) => b.importance !== 2);
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
+  const selectTag = useCallback((tag: string | null) => {
+    setMode('bookmarks');
+    setQuery('');
+    updateFilters({ tag });
+    setSidebarOpen(false);
+    window.scrollTo({ top: 0 });
+  }, [updateFilters]);
+
+  const selectScope = useCallback((next: Scope) => {
+    setMode('bookmarks');
+    switchScope(next);
+    setSidebarOpen(false);
+  }, [switchScope]);
+
+  const rowHandlers: CardHandlers = {
+    categories: flatCategories,
+    onReenriched: refreshOne,
+    onUpdate: updateBookmark,
+    onDelete: removeBookmark,
+    onToggleWatched: toggleWatched,
+    onTag: selectTag,
+    onCollection: (id) => selectScope({ kind: 'category', id }),
+  };
+
+  const showSidebar = mode === 'bookmarks';
+
+  // Narrow-screen drawer behaves like a modal: background is inert, focus
+  // moves into the drawer, Escape closes it, and focus returns to the toggle.
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell || !sidebarOpen) return;
+    const background = shell.querySelectorAll<HTMLElement>(':scope > .top-bar, :scope > .app-body > .app-main');
+    background.forEach((el) => el.setAttribute('inert', ''));
+    shell.querySelector<HTMLElement>('#sidebar button')?.focus();
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setSidebarOpen(false); };
+    document.addEventListener('keydown', onKey);
+    const toggle = sidebarToggleRef.current;
+    return () => {
+      background.forEach((el) => el.removeAttribute('inert'));
+      document.removeEventListener('keydown', onKey);
+      toggle?.focus();
+    };
+  }, [sidebarOpen]);
+
+  // The drawer only exists below 860px; widening the window closes it so the
+  // inert background never outlives the overlay.
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 860px)');
+    const onChange = () => { if (!mq.matches) setSidebarOpen(false); };
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
   return (
-    <div className={`app-shell${sidebarOpen ? '' : ' sidebar-collapsed'}`}>
-      <Sidebar
-        open={sidebarOpen}
-        onToggle={() => setSidebarOpen((v) => !v)}
-        tree={tree.roots}
-        uncategorizedCount={uncategorizedCount}
-        libraryTotal={libraryTotal}
-        scope={scope}
-        onScopeChange={(next) => { setMode('bookmarks'); switchScope(next); }}
-        onCategoriesChanged={loadCategories}
+    <div className="app-shell" ref={shellRef}>
+      <TopBar
         mode={mode}
         onModeChange={setMode}
+        onHome={() => { selectScope({ kind: 'all' }); setQuery(''); setAsk(null); }}
+        query={query}
+        onQueryChange={(q) => { setMode('bookmarks'); setQuery(q); }}
+        onAsk={askQuestion}
         theme={theme}
         onThemeToggle={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
       />
 
-      <main className="app-main">
-        <header className="app-header">
-          <button
-            className="sidebar-btn"
-            onClick={() => setSidebarOpen((v) => !v)}
-            title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
-            aria-label="Toggle sidebar"
-          >
-            ☰
-          </button>
-          <h1>{mode === 'feeds' ? 'Feeds' : mode === 'settings' ? 'Settings' : mode === 'shortlinks' ? 'Short links' : scopeHeading}</h1>
-          {mode === 'bookmarks' && <span className="header-count">{total.toLocaleString()}</span>}
-          {mode === 'bookmarks' && (
-            <div className="controls">
-              <button onClick={() => setView((v) => (v === 'list' ? 'grid' : 'list'))}>
-                {view === 'list' ? 'Grid' : 'List'}
+      <div className={`app-body${showSidebar ? ' has-sidebar' : ''}${sidebarOpen ? ' sidebar-open' : ''}`}>
+        <main className="app-main">
+          {mode === 'settings' && <><h1 className="view-title">Settings</h1><SettingsView onArchived={refresh} /></>}
+          {mode === 'feeds' && <><h1 className="view-title">Feeds</h1><FeedsView initialFeedId={readUrlState().feedId} /></>}
+          {mode === 'shortlinks' && <><h1 className="view-title">Short links</h1><ShortlinksView /></>}
+          {mode === 'bookmarks' && (<>
+            <AddForm onSaved={refresh} />
+
+            {ask && (
+              <ChatPanel
+                key={ask.id}
+                question={ask.text}
+                onRetry={() => askQuestion(ask.text)}
+                onClose={() => setAsk(null)}
+              />
+            )}
+
+            {searchResults === null && !loading && !error && scope.kind === 'all' && page === 0 && !isFilterActive(filters) && (
+              <TodaysPicks />
+            )}
+
+            <div className="list-head">
+              <h1 className="list-title">
+                {scopeHeading}
+                {filters.tag && <span className="list-title-tag"> · {filters.tag}</span>}
+                <span className="list-count">{total.toLocaleString()}</span>
+              </h1>
+              <button
+                ref={sidebarToggleRef}
+                type="button"
+                className="sidebar-toggle"
+                onClick={() => setSidebarOpen(true)}
+                aria-expanded={sidebarOpen}
+                aria-controls="sidebar"
+              >
+                Collections &amp; tags
               </button>
             </div>
-          )}
-        </header>
 
-        {mode === 'settings' && <SettingsView onArchived={refresh} />}
-        {mode === 'feeds' && <FeedsView initialFeedId={readUrlState().feedId} />}
-        {mode === 'shortlinks' && <ShortlinksView />}
-        {mode === 'bookmarks' && (<>
-        <AddForm onSaved={refresh} />
-
-        <input
-          type="search"
-          className="search-input"
-          placeholder="Search your library — describe what you're looking for…"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-
-        {searchResults === null && (
-          <FilterBar
-            filters={filters}
-            facets={facets}
-            onChange={updateFilters}
-            onReset={() => updateFilters(EMPTY_FILTERS)}
-          />
-        )}
-
-        <ChatPanel />
-
-        {loading && <p className="empty">Loading…</p>}
-        {error && <p className="empty">Error: {error}</p>}
-
-        {searchResults === null && !loading && !error && scope.kind === 'all' && page === 0 && !isFilterActive(filters) && (
-          <TodaysPicks
-            view={view}
-            categories={flatCategories}
-            onReenriched={refreshOne}
-            onUpdate={updateBookmark}
-            onDelete={removeBookmark}
-            onToggleWatched={toggleWatched}
-          />
-        )}
-
-        {searchResults !== null ? (
-          <section>
-            <h2>
-              {searching ? 'Searching…' : `Results for "${query.trim()}"`}
-              {!searching && ` — ${searchResults.length}`}
-            </h2>
-            <BookmarkList
-              items={searchResults}
-              view={view}
-              categories={flatCategories}
-              onReenriched={refreshOne}
-              onUpdate={updateBookmark}
-              onDelete={removeBookmark}
-              onToggleWatched={toggleWatched}
-              emptyMessage={`No strong matches for "${query.trim()}". Try a longer or more specific query.`}
-            />
-          </section>
-        ) : (
-          <>
-            {!loading && !error && pinned.length > 0 && page === 0 && (
-              <section>
-                <h2>Pinned</h2>
-                <BookmarkList
-                  items={pinned}
-                  view={view}
-                  categories={flatCategories}
-                  onReenriched={refreshOne}
-                  onUpdate={updateBookmark}
-                  onDelete={removeBookmark}
-                  onToggleWatched={toggleWatched}
-                />
-              </section>
+            {searchResults === null && (
+              <FilterBar
+                filters={filters}
+                facets={facets}
+                onChange={updateFilters}
+                onReset={() => updateFilters(EMPTY_FILTERS)}
+              />
             )}
 
-            {!loading && !error && (
+            {loading && <p className="empty">Loading…</p>}
+            {error && <p className="empty">Couldn't load bookmarks ({error}). Refresh to try again.</p>}
+
+            {searchResults !== null ? (
               <section>
                 <h2>
-                  {page === 0 ? 'Recent' : `Page ${page + 1}`}
-                  <span className="count-hint">
-                    — {bookmarks.length} on this page · {total.toLocaleString()} total
-                  </span>
+                  {searching ? 'Searching…' : `Matches for "${query.trim()}"`}
+                  {!searching && <span className="count-hint"> · {searchResults.length}</span>}
                 </h2>
                 <BookmarkList
-                  items={page === 0 ? rest : bookmarks}
-                  view={view}
-                  categories={flatCategories}
-                  onReenriched={refreshOne}
-                  onUpdate={updateBookmark}
-                  onDelete={removeBookmark}
-                  onToggleWatched={toggleWatched}
+                  items={searchResults}
+                  emptyMessage={`No strong matches for "${query.trim()}". Try a longer or more specific query, or press Enter to ask.`}
+                  {...rowHandlers}
                 />
-                {totalPages > 1 && (
-                  <Pagination
-                    page={page}
-                    totalPages={totalPages}
-                    onChange={setPage}
-                  />
-                )}
               </section>
+            ) : (
+              <>
+                {!loading && !error && pinned.length > 0 && page === 0 && (
+                  <section>
+                    <h2>Pinned</h2>
+                    <BookmarkList items={pinned} {...rowHandlers} />
+                  </section>
+                )}
+
+                {!loading && !error && (
+                  <section>
+                    <h2>
+                      {page === 0 ? 'Recent' : `Page ${page + 1}`}
+                      <span className="count-hint"> · {bookmarks.length} of {total.toLocaleString()}</span>
+                    </h2>
+                    <BookmarkList
+                      items={page === 0 ? rest : bookmarks}
+                      emptyMessage={
+                        isFilterActive(filters)
+                          ? 'Nothing matches these filters. Clear them to see everything.'
+                          : undefined
+                      }
+                      {...rowHandlers}
+                    />
+                    {totalPages > 1 && (
+                      <Pagination page={page} totalPages={totalPages} onChange={setPage} />
+                    )}
+                  </section>
+                )}
+              </>
             )}
-          </>
+          </>)}
+        </main>
+
+        {showSidebar && (
+          <Sidebar
+            tree={tree.roots}
+            uncategorizedCount={uncategorizedCount}
+            libraryTotal={libraryTotal}
+            scope={scope}
+            onScopeChange={selectScope}
+            onCategoriesChanged={loadCategories}
+            tags={facets.tags}
+            activeTag={filters.tag}
+            onTagSelect={selectTag}
+            onClose={() => setSidebarOpen(false)}
+          />
         )}
-        </>)}
-      </main>
+        {showSidebar && sidebarOpen && (
+          <button
+            type="button"
+            className="sidebar-backdrop"
+            aria-label="Close collections and tags"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
+      </div>
     </div>
   );
 }
 
-function Sidebar({
-  open, onToggle, tree, uncategorizedCount, libraryTotal,
-  scope, onScopeChange, onCategoriesChanged, mode, onModeChange,
-  theme, onThemeToggle,
+// Top bar: brand, view links, the search-or-ask box, theme toggle. Search is
+// live as you type (semantic); Enter sends the same text to the library chat.
+function TopBar({
+  mode, onModeChange, onHome, query, onQueryChange, onAsk, theme, onThemeToggle,
 }: {
-  open: boolean;
-  onToggle: () => void;
-  tree: CategoryNode[];
-  uncategorizedCount: number;
-  libraryTotal: number;
-  scope: Scope;
-  onScopeChange: (s: Scope) => void;
-  onCategoriesChanged: () => Promise<void> | void;
   mode: Mode;
   onModeChange: (m: Mode) => void;
+  onHome: () => void;
+  query: string;
+  onQueryChange: (q: string) => void;
+  onAsk: (q: string) => void;
   theme: Theme;
   onThemeToggle: () => void;
 }) {
-  const [creatingUnder, setCreatingUnder] = useState<number | null | 'root-requested'>(null);
-  const [newName, setNewName] = useState('');
-  const [parsing, setParsing] = useState(false);
-  const [parseMsg, setParseMsg] = useState<string | null>(null);
   const [feedsUnread, setFeedsUnread] = useState<number | null>(null);
 
-  // Badge refreshes on mount and when the user switches to the feeds view —
-  // the FeedsView updates the count indirectly via mode toggles after reads.
+  // Badge refreshes on mount and when the user switches views — FeedsView
+  // changes the count indirectly as items get read.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -724,6 +781,82 @@ function Sidebar({
     })();
     return () => { cancelled = true; };
   }, [mode]);
+
+  const ask = (e: FormEvent) => {
+    e.preventDefault();
+    const q = query.trim();
+    if (q) onAsk(q);
+  };
+
+  const navItem = (m: Mode, label: string, badge?: number | null) => (
+    <button
+      type="button"
+      className={`top-nav-item${mode === m ? ' active' : ''}`}
+      aria-current={mode === m ? 'page' : undefined}
+      onClick={() => onModeChange(m)}
+    >
+      {label}
+      {badge ? <span className="top-nav-badge">{badge.toLocaleString()}</span> : null}
+    </button>
+  );
+
+  return (
+    <header className="top-bar">
+      <button type="button" className="brand" onClick={onHome} title="All bookmarks">
+        bookmarks<span className="brand-mark" aria-hidden>✦</span>
+      </button>
+      <nav className="top-nav" aria-label="Views">
+        {navItem('bookmarks', 'library')}
+        {navItem('feeds', 'feeds', feedsUnread)}
+        {navItem('shortlinks', 'short links')}
+        {navItem('settings', 'settings')}
+      </nav>
+      <form className="top-search" role="search" onSubmit={ask}>
+        <input
+          type="search"
+          value={query}
+          onChange={(e) => onQueryChange(e.target.value)}
+          placeholder="Search, or press Enter to ask…"
+          aria-label="Search your library, or press Enter to ask a question"
+        />
+        <button type="submit" disabled={!query.trim()} title="Ask your library about this">
+          Ask
+        </button>
+      </form>
+      <button
+        type="button"
+        className="theme-toggle"
+        onClick={onThemeToggle}
+        title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+        aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+      >
+        {theme === 'light' ? '☾' : '☀'}
+      </button>
+    </header>
+  );
+}
+
+// Right-hand column (a panel on narrow screens): library scopes, the
+// collection tree, and the tag list. Tags come from the AI tagger.
+function Sidebar({
+  tree, uncategorizedCount, libraryTotal, scope, onScopeChange, onCategoriesChanged,
+  tags, activeTag, onTagSelect, onClose,
+}: {
+  tree: CategoryNode[];
+  uncategorizedCount: number;
+  libraryTotal: number;
+  scope: Scope;
+  onScopeChange: (s: Scope) => void;
+  onCategoriesChanged: () => Promise<void> | void;
+  tags: FacetsPayload['tags'];
+  activeTag: string | null;
+  onTagSelect: (tag: string | null) => void;
+  onClose: () => void;
+}) {
+  const [creatingUnder, setCreatingUnder] = useState<number | null | 'root-requested'>(null);
+  const [newName, setNewName] = useState('');
+  const [parsing, setParsing] = useState(false);
+  const [parseMsg, setParseMsg] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(() => {
     try {
       const raw = localStorage.getItem(EXPANDED_KEY);
@@ -789,51 +922,26 @@ function Sidebar({
     }
   };
 
-  if (!open) return null;
-
   return (
-    <aside className="sidebar" aria-label="Collections">
-      <div className="sidebar-head">
+    <aside className="sidebar" id="sidebar" aria-label="Collections and tags">
+      {/* Drawer-only (narrow screens); hidden by CSS when the sidebar is a column. */}
+      <button type="button" className="sidebar-close" onClick={onClose}>
+        Close
+      </button>
+      <nav className="sidebar-nav" aria-label="Library">
         <button
-          className="sidebar-brand"
-          onClick={() => onScopeChange({ kind: 'all' })}
-          title="Go to All bookmarks"
-        >
-          Bookmarks
-        </button>
-        <button className="sidebar-btn" onClick={onToggle} title="Collapse sidebar">‹</button>
-      </div>
-
-      <div className="sidebar-body">
-      <nav className="sidebar-nav">
-        <button
-          className={`sidebar-item${mode === 'bookmarks' && scope.kind === 'all' ? ' active' : ''}`}
+          className={`sidebar-item${scope.kind === 'all' ? ' active' : ''}`}
           onClick={() => onScopeChange({ kind: 'all' })}
         >
           <span className="sidebar-item-label">All bookmarks</span>
           <span className="sidebar-item-count">{libraryTotal.toLocaleString()}</span>
         </button>
         <button
-          className={`sidebar-item${mode === 'bookmarks' && scope.kind === 'uncategorized' ? ' active' : ''}`}
+          className={`sidebar-item${scope.kind === 'uncategorized' ? ' active' : ''}`}
           onClick={() => onScopeChange({ kind: 'uncategorized' })}
         >
           <span className="sidebar-item-label">Uncategorized</span>
           <span className="sidebar-item-count">{uncategorizedCount.toLocaleString()}</span>
-        </button>
-        <button
-          className={`sidebar-item${mode === 'feeds' ? ' active' : ''}`}
-          onClick={() => onModeChange('feeds')}
-        >
-          <span className="sidebar-item-label">Feeds</span>
-          {feedsUnread !== null && feedsUnread > 0 && (
-            <span className="sidebar-item-count">{feedsUnread.toLocaleString()}</span>
-          )}
-        </button>
-        <button
-          className={`sidebar-item${mode === 'shortlinks' ? ' active' : ''}`}
-          onClick={() => onModeChange('shortlinks')}
-        >
-          <span className="sidebar-item-label">Short links</span>
         </button>
       </nav>
 
@@ -843,6 +951,7 @@ function Sidebar({
           className="sidebar-mini-btn"
           onClick={() => setCreatingUnder('root-requested')}
           title="New top-level collection"
+          aria-label="New top-level collection"
         >
           +
         </button>
@@ -858,7 +967,7 @@ function Sidebar({
         />
       )}
 
-      <nav className="sidebar-nav">
+      <nav className="sidebar-nav" aria-label="Collections">
         {tree.length === 0 && creatingUnder === null && (
           <div className="sidebar-empty">
             No collections yet.{' '}
@@ -894,25 +1003,30 @@ function Sidebar({
         </div>
       )}
       {parseMsg && <div className="sidebar-hint">{parseMsg}</div>}
-      </div>
 
-      <div className="sidebar-foot">
-        <button
-          className="theme-toggle"
-          onClick={onThemeToggle}
-          title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
-        >
-          {theme === 'light' ? '☾ Dark mode' : '☀ Light mode'}
-        </button>
-        <button
-          className={`sidebar-foot-icon${mode === 'settings' ? ' active' : ''}`}
-          onClick={() => onModeChange('settings')}
-          title="Settings"
-          aria-label="Settings"
-        >
-          ⚙
-        </button>
+      <div className="sidebar-section-head">
+        <span>Tags</span>
+        {activeTag && (
+          <button className="link-btn inline" onClick={() => onTagSelect(null)}>clear</button>
+        )}
       </div>
+      {tags.length === 0 ? (
+        <div className="sidebar-empty">Tags appear here as bookmarks get summarized.</div>
+      ) : (
+        <div className="tag-list">
+          {tags.map((t) => (
+            <button
+              key={t.name}
+              type="button"
+              className={`tag-list-item${activeTag === t.name ? ' active' : ''}`}
+              aria-pressed={activeTag === t.name}
+              onClick={() => onTagSelect(activeTag === t.name ? null : t.name)}
+            >
+              {t.name}<span className="tag-list-count">{t.count}</span>
+            </button>
+          ))}
+        </div>
+      )}
     </aside>
   );
 }
@@ -1088,68 +1202,88 @@ function FilterBar({
   const active = isFilterActive(filters);
   const videoFacet = facets.contentTypes.find((c) => c.name === 'video');
   const xPostFacet = facets.contentTypes.find((c) => c.name === 'x');
+  const importance: Array<[MinImportance, string]> = [[0, 'all'], [1, 'important'], [2, 'pinned']];
   return (
     <div className="filter-bar" aria-label="Filters">
-      <select
-        className="filter-select"
-        value={String(filters.minImportance)}
-        onChange={(e) => onChange({ minImportance: Number(e.target.value) as MinImportance })}
-        title="Filter by importance"
-      >
-        <option value="0">All</option>
-        <option value="1">Important+</option>
-        <option value="2">Pinned only</option>
-      </select>
-      {videoFacet && (
+      <div className="filter-group" role="group" aria-label="Importance">
+        {importance.map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            className={`filter-link${filters.minImportance === value ? ' active' : ''}`}
+            aria-pressed={filters.minImportance === value}
+            onClick={() => onChange({ minImportance: value })}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {(videoFacet || xPostFacet) && (
+        <div className="filter-group" role="group" aria-label="Type">
+          {videoFacet && (
+            <button
+              type="button"
+              className={`filter-link${filters.contentType === 'video' ? ' active' : ''}`}
+              aria-pressed={filters.contentType === 'video'}
+              onClick={() => onChange({ contentType: filters.contentType === 'video' ? null : 'video' })}
+            >
+              videos <span className="filter-count">{videoFacet.count.toLocaleString()}</span>
+            </button>
+          )}
+          {xPostFacet && (
+            <button
+              type="button"
+              className={`filter-link${filters.contentType === 'x' ? ' active' : ''}`}
+              aria-pressed={filters.contentType === 'x'}
+              onClick={() => onChange({ contentType: filters.contentType === 'x' ? null : 'x' })}
+            >
+              𝕏 posts <span className="filter-count">{xPostFacet.count.toLocaleString()}</span>
+            </button>
+          )}
+        </div>
+      )}
+      <div className="filter-group">
+        <select
+          className="filter-select"
+          value={filters.domain ?? ''}
+          onChange={(e) => onChange({ domain: e.target.value || null })}
+          aria-label="Filter by site"
+          disabled={facets.domains.length === 0}
+        >
+          <option value="">any site</option>
+          {facets.domains.map((d) => (
+            <option key={d.name} value={d.name}>
+              {d.name} ({d.count.toLocaleString()})
+            </option>
+          ))}
+        </select>
+        <select
+          className="filter-select"
+          value={filters.year ?? ''}
+          onChange={(e) => onChange({ year: e.target.value || null })}
+          aria-label="Filter by year saved"
+          disabled={facets.years.length === 0}
+        >
+          <option value="">any year</option>
+          {facets.years.map((y) => (
+            <option key={y.year} value={y.year}>
+              {y.year} ({y.count.toLocaleString()})
+            </option>
+          ))}
+        </select>
+      </div>
+      {filters.tag && (
         <button
           type="button"
-          className={`filter-chip${filters.contentType === 'video' ? ' active' : ''}`}
-          onClick={() => onChange({ contentType: filters.contentType === 'video' ? null : 'video' })}
-          title="Show only videos"
+          className="filter-tag"
+          onClick={() => onChange({ tag: null })}
+          title="Remove tag filter"
         >
-          ▶ Videos ({videoFacet.count.toLocaleString()})
+          tag: {filters.tag} <span aria-hidden>×</span>
         </button>
       )}
-      {xPostFacet && (
-        <button
-          type="button"
-          className={`filter-chip${filters.contentType === 'x' ? ' active' : ''}`}
-          onClick={() => onChange({ contentType: filters.contentType === 'x' ? null : 'x' })}
-          title="Show only x.com posts"
-        >
-          𝕏 Posts ({xPostFacet.count.toLocaleString()})
-        </button>
-      )}
-      <select
-        className="filter-select"
-        value={filters.domain ?? ''}
-        onChange={(e) => onChange({ domain: e.target.value || null })}
-        title="Filter by domain"
-        disabled={facets.domains.length === 0}
-      >
-        <option value="">All domains</option>
-        {facets.domains.map((d) => (
-          <option key={d.name} value={d.name}>
-            {d.name} ({d.count.toLocaleString()})
-          </option>
-        ))}
-      </select>
-      <select
-        className="filter-select"
-        value={filters.year ?? ''}
-        onChange={(e) => onChange({ year: e.target.value || null })}
-        title="Filter by year saved"
-        disabled={facets.years.length === 0}
-      >
-        <option value="">All years</option>
-        {facets.years.map((y) => (
-          <option key={y.year} value={y.year}>
-            {y.year} ({y.count.toLocaleString()})
-          </option>
-        ))}
-      </select>
       {active && (
-        <button className="filter-clear" onClick={onReset} title="Clear all filters">
+        <button type="button" className="filter-clear" onClick={onReset}>
           Clear filters
         </button>
       )}
@@ -1750,22 +1884,23 @@ interface CardHandlers {
   onUpdate: (id: number, patch: Patch) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
   onToggleWatched: (id: number, watched: boolean) => Promise<void>;
+  onTag: (tag: string) => void;
+  onCollection: (id: number) => void;
 }
 
 function BookmarkList({
-  items, view, emptyMessage, ...handlers
+  items, emptyMessage, ...handlers
 }: {
   items: Bookmark[];
-  view: View;
   emptyMessage?: string;
 } & CardHandlers) {
   if (!items.length) {
-    return <p className="empty">{emptyMessage ?? 'Nothing here yet — save something from the Chrome extension.'}</p>;
+    return <p className="empty">{emptyMessage ?? 'Nothing here yet. Paste a URL above, or save one from the extension.'}</p>;
   }
   return (
-    <div className={`bookmarks ${view}`}>
+    <div className="bookmarks">
       {items.map((b) => (
-        <BookmarkCard key={b.id} b={b} {...handlers} />
+        <BookmarkRow key={b.id} b={b} {...handlers} />
       ))}
     </div>
   );
@@ -2030,8 +2165,39 @@ function markdownErrorMessage(f: MarkdownFailure): string {
   }
 }
 
-function BookmarkCard({
-  b, categories, onReenriched, onUpdate, onDelete, onToggleWatched,
+// Who wrote the summary currently shown, from metadata.summary_source. Shown
+// next to every AI summary so it's always clear which model (or the page
+// itself) produced the text.
+interface SummarySource { label: string; title: string; ai: boolean }
+
+const SUMMARY_SOURCES: Record<string, SummarySource> = {
+  'haiku-auto': { label: '✦ haiku', title: 'Summarized automatically by Claude Haiku', ai: true },
+  'gemma': { label: '✦ gemma', title: 'Summarized automatically by Gemma (fallback model)', ai: true },
+  'haiku-detailed': { label: '🔮 oracle', title: 'Detailed summary from the full page (Oracle)', ai: true },
+  'on-device': { label: '✦ on-device', title: "Summarized in your browser by Chrome's built-in model", ai: true },
+  'extract': { label: 'from page', title: 'Text taken from the page, not AI-written', ai: false },
+};
+
+function summarySource(metadata: string): SummarySource | null {
+  try {
+    const parsed = JSON.parse(metadata) as { summary_source?: unknown };
+    return typeof parsed.summary_source === 'string' ? SUMMARY_SOURCES[parsed.summary_source] ?? null : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseTags(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((t): t is string => typeof t === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function BookmarkRow({
+  b, categories, onReenriched, onUpdate, onDelete, onToggleWatched, onTag, onCollection,
 }: { b: Bookmark } & CardHandlers) {
   const [busy, setBusy] = useState(false);
   const [oracleBusy, setOracleBusy] = useState(false);
@@ -2080,8 +2246,8 @@ function BookmarkCard({
     setTimeout(async () => { await onReenriched(b.id); setBusy(false); }, 3500);
   };
 
-  // "Call the Oracle": opt-in Haiku summary. Synchronous unlike re-enrich, so
-  // we can show the new summary immediately by refetching the row on success.
+  // "Call the Oracle": a deeper summary from the full page text. Synchronous
+  // unlike re-enrich, so we show the new summary by refetching the row.
   // Errors get a brief inline hint rather than a global toast — the user is
   // standing right there clicking the button.
   const callOracle = async () => {
@@ -2109,9 +2275,15 @@ function BookmarkCard({
   };
 
   const remove = () => {
-    if (!confirm(`Delete "${b.title ?? b.url}"?`)) return;
+    if (!confirm(`Archive "${b.title ?? b.url}"?`)) return;
     void onDelete(b.id);
   };
+
+  const [editing, setEditing] = useState(false);
+  const [read, setRead] = useState(b.last_viewed_at != null);
+  useEffect(() => { setRead(b.last_viewed_at != null); }, [b.last_viewed_at]);
+
+  const open = () => { markViewed(b.id); setRead(true); };
 
   const isVideo = b.content_type === 'video';
   const isXPost = b.content_type === 'x';
@@ -2119,158 +2291,131 @@ function BookmarkCard({
   const xPost = isXPost ? parseXPostMetadata(b.metadata) : null;
   const durationLabel = video ? formatDurationSec(video.durationSec) : null;
   const isWatched = !!video?.watchedAt;
+  const source = b.ai_summary ? summarySource(b.metadata) : null;
+  const tags = parseTags(b.ai_tags);
+  const collection = b.category_id !== null ? categories.find((c) => c.id === b.category_id) : undefined;
+  const site = xPost?.handle ? `@${xPost.handle}` : video?.channel ?? b.domain;
 
-  const pinnedClass = b.importance === 2 ? ' pinned' : b.importance === 1 ? ' important' : '';
-  const videoClass = isVideo ? ' is-video' : '';
-  const xPostClass = isXPost ? ' is-x-post' : '';
-  const watchedClass = isWatched ? ' watched' : '';
-
-  const showMarkdownButton = isMarkdownEligible(b);
+  const rowClass = [
+    'bookmark',
+    b.importance === 2 ? 'pinned' : b.importance === 1 ? 'important' : '',
+    isWatched ? 'watched' : '',
+    editing ? 'editing' : '',
+  ].filter(Boolean).join(' ');
 
   return (
-    <div className={`bookmark${pinnedClass}${videoClass}${xPostClass}${watchedClass}`}>
-      {b.og_image_url && (
-        <a
-          href={b.url}
-          target="_blank"
-          rel="noreferrer"
-          className="bookmark-thumb"
-          onClick={() => markViewed(b.id)}
-          onAuxClick={(e) => { if (e.button === 1) markViewed(b.id); }}
-        >
-          <img src={b.og_image_url} alt="" />
-          {isVideo && <span className="play-overlay" aria-hidden>▶</span>}
-          {isXPost && <span className="play-overlay" aria-hidden>𝕏</span>}
-          {durationLabel && <span className="duration-badge">{durationLabel}</span>}
-        </a>
-      )}
-      <div className="bookmark-body">
-        <a
-          href={b.url}
-          target="_blank"
-          rel="noreferrer"
-          className="title"
-          onClick={() => markViewed(b.id)}
-          onAuxClick={(e) => { if (e.button === 1) markViewed(b.id); }}
-        >
-          {b.title ?? b.url}
-        </a>
-        <div className="domain">
-          {xPost?.handle ? (
-            <span className="channel">@{xPost.handle}</span>
-          ) : video?.channel ? (
-            <span className="channel">{video.channel}</span>
-          ) : (
-            b.domain
-          )}
-        </div>
-        {b.ai_summary && <div className="summary">{b.ai_summary}</div>}
-        {!b.ai_summary && b.status === 'imported' && (
-          <div className="summary muted-hint">Imported — click ↻ to enrich.</div>
-        )}
-        {renderTags(b.ai_tags)}
-        <CategoryPicker
-          value={b.category_id}
-          options={categories}
-          onChange={(next) => onUpdate(b.id, { category_id: next })}
-        />
-        <NoteField
-          note={b.note}
-          onSave={(note) => onUpdate(b.id, { note })}
-        />
-      </div>
-      <div className="actions">
+    <article className={rowClass}>
+      <div className="bookmark-head">
         <button
-          className={`icon-btn shorten-btn${shortCode ? ' has-code' : ''}`}
-          onClick={shortenAndCopy}
-          title={shortCode ? `Copy short URL (${shortCode})` : 'Shorten & copy URL'}
-          aria-label="Shorten and copy URL"
-        >
-          🔗
-        </button>
-        {shortCode && clickCount > 0 && (
-          <button
-            className="icon-btn click-badge"
-            onClick={() => setStatsOpen(true)}
-            title={`${clickCount.toLocaleString()} click${clickCount === 1 ? '' : 's'} — open stats`}
-          >
-            {clickCount.toLocaleString()}
-          </button>
-        )}
-        {copyHint && <span className="copy-hint" role="status">{copyHint}</span>}
-        <button
-          className={`icon-btn importance-btn importance-${b.importance}`}
+          type="button"
+          className={`star importance-${b.importance}`}
           onClick={cycleImportance}
           title={importanceLabel(b.importance)}
+          aria-label={importanceLabel(b.importance)}
         >
           {importanceIcon(b.importance)}
         </button>
-        {isVideo && (
-          <button
-            className={`icon-btn watched-btn${isWatched ? ' watched' : ''}`}
-            onClick={() => void onToggleWatched(b.id, !isWatched)}
-            title={isWatched ? 'Watched — click to mark unwatched' : 'Mark as watched'}
-          >
-            {isWatched ? '✓' : '◯'}
-          </button>
-        )}
-        {showMarkdownButton && (
-          <a
-            className="icon-btn markdown-btn"
-            href={`/reader/${b.id}`}
-            target="_blank"
-            rel="noreferrer"
-            title="Preview as markdown (opens in new tab)"
-            aria-label="Preview as markdown"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              width="15"
-              height="15"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.75"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
-              <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
-            </svg>
-          </a>
-        )}
-        {b.ai_summary && (
-          <button
-            className="icon-btn oracle-btn"
-            onClick={callOracle}
-            disabled={oracleBusy}
-            title="Call the Oracle: regenerate this summary with Haiku"
-            aria-label="Call the Oracle"
-          >
-            {oracleBusy ? '…' : '🔮'}
-          </button>
-        )}
-        {oracleHint && <span className="copy-hint" role="status">{oracleHint}</span>}
-        <button
-          className="icon-btn reenrich-btn"
-          onClick={reenrich}
-          disabled={busy}
-          title="Re-enrich: refetch page, regenerate summary and embedding"
+        <a
+          href={b.url}
+          target="_blank"
+          rel="noreferrer"
+          className={`title${read ? ' is-read' : ''}`}
+          onClick={open}
+          onAuxClick={(e) => { if (e.button === 1) open(); }}
         >
-          {busy ? '…' : '↻'}
-        </button>
-        <button
-          className="icon-btn delete-btn"
-          onClick={remove}
-          title="Archive this bookmark"
-        >
-          ✕
-        </button>
+          {b.title ?? b.url}
+        </a>
+        {isVideo && <span className="kind">▶{durationLabel ? ` ${durationLabel}` : ''}</span>}
+        {isXPost && <span className="kind">𝕏</span>}
       </div>
+
+      {b.note && <p className="note">{b.note}</p>}
+      {b.ai_summary ? (
+        <p className="summary">
+          {b.ai_summary}
+          {source && <span className={`source${source.ai ? ' ai' : ''}`} title={source.title}>{source.label}</span>}
+        </p>
+      ) : b.status === 'imported' ? (
+        <p className="summary muted-hint">Imported without a summary. Use re-enrich to summarize it.</p>
+      ) : b.status === 'pending' ? (
+        <p className="summary muted-hint">Summarizing…</p>
+      ) : null}
+
+      <div className="meta">
+        {tags.map((t) => (
+          <button key={t} type="button" className="tag" onClick={() => onTag(t)} title={`Show bookmarks tagged ${t}`}>
+            {t}
+          </button>
+        ))}
+        {site && <span className="site">{site}</span>}
+        {collection && (
+          <button type="button" className="collection" onClick={() => onCollection(collection.id)}>
+            in {collection.path}
+          </button>
+        )}
+        <time dateTime={new Date(b.created_at).toISOString()} title={new Date(b.created_at).toLocaleString()}>
+          {formatRelativeTime(b.created_at)}
+        </time>
+        <span className="actions">
+          <button type="button" onClick={() => setEditing((v) => !v)} aria-expanded={editing}>
+            {editing ? 'done' : 'edit'}
+          </button>
+          {isMarkdownEligible(b) && (
+            <a href={`/reader/${b.id}`} target="_blank" rel="noreferrer" title="Read as clean text in a new tab">
+              reader
+            </a>
+          )}
+          {isVideo && (
+            <button type="button" onClick={() => void onToggleWatched(b.id, !isWatched)}>
+              {isWatched ? 'watched ✓' : 'mark watched'}
+            </button>
+          )}
+          {b.status !== 'pending' && (
+            <button
+              type="button"
+              className="oracle"
+              onClick={callOracle}
+              disabled={oracleBusy}
+              title="Call the Oracle: a longer summary from the full page"
+            >
+              {oracleBusy ? '🔮 reading…' : '🔮 oracle'}
+            </button>
+          )}
+          <button type="button" className="danger" onClick={remove}>archive</button>
+          {(copyHint || oracleHint) && (
+            <span className="hint" role="status">{copyHint ?? oracleHint}</span>
+          )}
+        </span>
+      </div>
+
+      {editing && (
+        <div className="edit-panel">
+          <CategoryPicker
+            value={b.category_id}
+            options={categories}
+            onChange={(next) => onUpdate(b.id, { category_id: next })}
+          />
+          <NoteField note={b.note} onSave={(note) => onUpdate(b.id, { note })} />
+          <div className="edit-actions">
+            <button type="button" className="link-btn" onClick={shortenAndCopy}>
+              {shortCode ? `Copy short link /s/${shortCode}` : 'Create short link'}
+            </button>
+            {shortCode && clickCount > 0 && (
+              <button type="button" className="link-btn" onClick={() => setStatsOpen(true)}>
+                {clickCount.toLocaleString()} click{clickCount === 1 ? '' : 's'}
+              </button>
+            )}
+            <button type="button" className="link-btn" onClick={reenrich} disabled={busy}>
+              {busy ? 'Re-enriching…' : 'Re-enrich (refetch and summarize again)'}
+            </button>
+          </div>
+        </div>
+      )}
+
       {statsOpen && (
         <ClickStatsModal bookmarkId={b.id} title={b.title ?? b.url} onClose={() => setStatsOpen(false)} />
       )}
-    </div>
+    </article>
   );
 }
 
@@ -2586,7 +2731,7 @@ function ShortlinksView() {
         <div className="shortlinks-empty">
           <div className="shortlinks-empty-icon" aria-hidden>🔗</div>
           <h3>No short links yet</h3>
-          <p>Open any bookmark and click the <strong>🔗</strong> button to mint a short URL — or use the Chrome extension's <strong>“Shorten &amp; copy URL”</strong> on any page.</p>
+          <p>In your library, choose <strong>edit</strong> on a bookmark, then <strong>Create short link</strong>. Or use the Chrome extension's <strong>“Shorten &amp; copy URL”</strong> on any page.</p>
           <p className="muted small">Short URLs look like <code>{window.location.origin}/s/aB3xZ9</code> and track clicks automatically.</p>
         </div>
       )}
@@ -2732,23 +2877,6 @@ function CategoryPicker({
   );
 }
 
-function renderTags(raw: string) {
-  if (!raw) return null;
-  let tags: string[] = [];
-  try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) tags = parsed.filter((t): t is string => typeof t === 'string');
-  } catch {
-    return null;
-  }
-  if (!tags.length) return null;
-  return (
-    <div className="tags">
-      {tags.map((t) => <span key={t} className="tag">{t}</span>)}
-    </div>
-  );
-}
-
 function importanceIcon(n: number): string {
   if (n === 2) return '★';
   if (n === 1) return '★';
@@ -2880,9 +3008,10 @@ const DUMMY_PICKS: PickEnvelope[] = [
   },
 ];
 
-function TodaysPicks({
-  view, ...handlers
-}: { view: View } & CardHandlers) {
+// Today's picks: 3-5 bookmarks the daily job chose, each with the model's
+// one-line reason. A compact list rather than full rows — it's a nudge, not
+// the library.
+function TodaysPicks() {
   const [picks, setPicks] = useState<PickEnvelope[] | null>(null);
   const [date, setDate] = useState<string>('');
   const [refreshing, setRefreshing] = useState(false);
@@ -2935,36 +3064,40 @@ function TodaysPicks({
     }
   };
 
-  if (picks === null) return null;
-  if (!picks.length) return null;
+  if (picks === null || !picks.length) return null;
 
   return (
-    <section className="picks-section">
-      <h2>
-        <button
-          type="button"
-          className="picks-toggle"
-          onClick={toggleCollapsed}
-          aria-expanded={!collapsed}
-          title={collapsed ? 'Expand' : 'Collapse'}
-        >
-          {collapsed ? '▸' : '▾'} Today's picks · {date}
-        </button>
+    <section className="picks" aria-label="Today's picks">
+      <div className="picks-head">
+        <span className="ai-label">today</span>
+        <span className="picks-title">Picked from your library for {date}</span>
         {!collapsed && (
-          <button className="link-btn" onClick={refresh} disabled={refreshing}>
-            {refreshing ? 'refreshing…' : 'refresh'}
+          <button type="button" className="link-btn" onClick={refresh} disabled={refreshing}>
+            {refreshing ? 'picking…' : 'pick again'}
           </button>
         )}
-      </h2>
+        <button type="button" className="link-btn" onClick={toggleCollapsed} aria-expanded={!collapsed}>
+          {collapsed ? 'show' : 'hide'}
+        </button>
+      </div>
       {!collapsed && (
-        <div className={`bookmarks ${view}`}>
+        <ul className="picks-list">
           {picks.map((p) => (
-            <div key={p.bookmark.id} className="pick-wrap">
-              {p.reason && <div className="pick-reason">{p.reason}</div>}
-              <BookmarkCard b={p.bookmark} {...handlers} />
-            </div>
+            <li key={p.bookmark.id}>
+              <a
+                href={p.bookmark.url}
+                target="_blank"
+                rel="noreferrer"
+                onClick={() => markViewed(p.bookmark.id)}
+                onAuxClick={(e) => { if (e.button === 1) markViewed(p.bookmark.id); }}
+              >
+                {p.bookmark.title ?? p.bookmark.url}
+              </a>
+              {p.bookmark.domain && <span className="site"> {p.bookmark.domain}</span>}
+              {p.reason && <div className="picks-reason">{p.reason}</div>}
+            </li>
           ))}
-        </div>
+        </ul>
       )}
     </section>
   );
@@ -2977,65 +3110,59 @@ interface ChatSource {
   domain: string | null;
 }
 
-function ChatPanel() {
-  const [open, setOpen] = useState(false);
-  const [question, setQuestion] = useState('');
+// Answer panel for a question asked from the top search box. Keyed on the
+// submission id by the parent, so every ask (including a retry of the same
+// text) mounts a fresh panel and request.
+function ChatPanel({
+  question, onRetry, onClose,
+}: { question: string; onRetry: () => void; onClose: () => void }) {
   const [answer, setAnswer] = useState<string>('');
   const [sources, setSources] = useState<ChatSource[]>([]);
-  const [asking, setAsking] = useState(false);
+  const [asking, setAsking] = useState(true);
   const [err, setErr] = useState<string | null>(null);
 
-  const ask = async (e: FormEvent) => {
-    e.preventDefault();
-    const q = question.trim();
-    if (!q || asking) return;
-    setAsking(true);
-    setAnswer('');
-    setSources([]);
-    setErr(null);
-    try {
-      const r = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: q }),
-      });
-      if (!r.ok) {
-        const body = (await r.json().catch(() => ({}))) as { error?: string };
-        throw new Error(body.error ?? `HTTP ${r.status}`);
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const r = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question }),
+          signal: controller.signal,
+        });
+        if (!r.ok) {
+          const body = (await r.json().catch(() => ({}))) as { error?: string };
+          throw new Error(body.error ?? `HTTP ${r.status}`);
+        }
+        const d = (await r.json()) as { answer: string; sources: ChatSource[] };
+        setAnswer(d.answer);
+        setSources(d.sources ?? []);
+      } catch (e) {
+        if ((e as Error).name === 'AbortError') return;
+        setErr((e as Error).message);
+      } finally {
+        setAsking(false);
       }
-      const d = (await r.json()) as { answer: string; sources: ChatSource[] };
-      setAnswer(d.answer);
-      setSources(d.sources ?? []);
-    } catch (e) {
-      setErr((e as Error).message);
-    } finally {
-      setAsking(false);
-    }
-  };
+    })();
+    return () => controller.abort();
+  }, [question]);
 
   return (
-    <section className={`chat-panel${open ? ' open' : ''}`}>
-      <button className="chat-toggle" onClick={() => setOpen((v) => !v)}>
-        {open ? '▾' : '▸'} Ask your library
-      </button>
-      {open && (
-        <div className="chat-body">
-          <form onSubmit={ask} className="chat-form">
-            <input
-              type="text"
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              placeholder="What did I save about vector databases?"
-              disabled={asking}
-            />
-            <button type="submit" disabled={asking || !question.trim()}>
-              {asking ? 'Thinking…' : 'Ask'}
-            </button>
-          </form>
-          {err && <div className="chat-error">Error: {err}</div>}
-          {answer && <ChatAnswer answer={answer} sources={sources} />}
-        </div>
+    <section className="chat-panel" aria-live="polite">
+      <div className="chat-head">
+        <span className="ai-label">ask</span>
+        <span className="chat-question">{question}</span>
+        <button type="button" className="link-btn" onClick={onClose} aria-label="Close answer">close</button>
+      </div>
+      {asking && <p className="chat-status">Reading your library…</p>}
+      {err && (
+        <p className="chat-error">
+          Couldn't answer: {err}{' '}
+          <button type="button" className="link-btn" onClick={onRetry}>Try again</button>
+        </p>
       )}
+      {answer && <ChatAnswer answer={answer} sources={sources} />}
     </section>
   );
 }
@@ -3444,7 +3571,7 @@ function FeedItemRow({
           className="feed-item-summary-btn"
           onClick={() => void onSummarize(item.id)}
         >
-          Get summary
+          Summarize
         </button>
       )}
     </li>
