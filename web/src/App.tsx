@@ -257,6 +257,8 @@ export default function App() {
   // Narrow screens only: the sidebar (collections, tags) is a panel the user
   // opens. On wide screens it's always visible and this flag is ignored.
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const shellRef = useRef<HTMLDivElement>(null);
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null);
 
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [total, setTotal] = useState(0);
@@ -273,8 +275,14 @@ export default function App() {
   const [searchResults, setSearchResults] = useState<Bookmark[] | null>(null);
   const [searching, setSearching] = useState(false);
   // Set when the user presses Enter in the search box: the same text goes to
-  // the library chat. Typing alone only searches.
-  const [askQuestion, setAskQuestion] = useState<string | null>(null);
+  // the library chat. Typing alone only searches. `id` changes on every
+  // submission so asking the same question again (e.g. after an error)
+  // starts a fresh request instead of reusing the mounted panel.
+  const [ask, setAsk] = useState<{ text: string; id: number } | null>(null);
+  const askQuestion = useCallback((text: string) => {
+    setMode('bookmarks');
+    setAsk((prev) => ({ text, id: (prev?.id ?? 0) + 1 }));
+  }, []);
 
   const [filters, setFilters] = useState<Filters>({ ...EMPTY_FILTERS, tag: INITIAL_URL_STATE.tag });
   const [facets, setFacets] = useState<FacetsPayload>(EMPTY_FACETS);
@@ -577,15 +585,42 @@ export default function App() {
 
   const showSidebar = mode === 'bookmarks';
 
+  // Narrow-screen drawer behaves like a modal: background is inert, focus
+  // moves into the drawer, Escape closes it, and focus returns to the toggle.
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell || !sidebarOpen) return;
+    const background = shell.querySelectorAll<HTMLElement>(':scope > .top-bar, :scope > .app-body > .app-main');
+    background.forEach((el) => el.setAttribute('inert', ''));
+    shell.querySelector<HTMLElement>('#sidebar button')?.focus();
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setSidebarOpen(false); };
+    document.addEventListener('keydown', onKey);
+    const toggle = sidebarToggleRef.current;
+    return () => {
+      background.forEach((el) => el.removeAttribute('inert'));
+      document.removeEventListener('keydown', onKey);
+      toggle?.focus();
+    };
+  }, [sidebarOpen]);
+
+  // The drawer only exists below 860px; widening the window closes it so the
+  // inert background never outlives the overlay.
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 860px)');
+    const onChange = () => { if (!mq.matches) setSidebarOpen(false); };
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
   return (
-    <div className="app-shell">
+    <div className="app-shell" ref={shellRef}>
       <TopBar
         mode={mode}
         onModeChange={setMode}
-        onHome={() => { selectScope({ kind: 'all' }); setQuery(''); setAskQuestion(null); }}
+        onHome={() => { selectScope({ kind: 'all' }); setQuery(''); setAsk(null); }}
         query={query}
         onQueryChange={(q) => { setMode('bookmarks'); setQuery(q); }}
-        onAsk={(q) => { setMode('bookmarks'); setAskQuestion(q); }}
+        onAsk={askQuestion}
         theme={theme}
         onThemeToggle={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
       />
@@ -598,8 +633,13 @@ export default function App() {
           {mode === 'bookmarks' && (<>
             <AddForm onSaved={refresh} />
 
-            {askQuestion && (
-              <ChatPanel key={askQuestion} question={askQuestion} onClose={() => setAskQuestion(null)} />
+            {ask && (
+              <ChatPanel
+                key={ask.id}
+                question={ask.text}
+                onRetry={() => askQuestion(ask.text)}
+                onClose={() => setAsk(null)}
+              />
             )}
 
             {searchResults === null && !loading && !error && scope.kind === 'all' && page === 0 && !isFilterActive(filters) && (
@@ -613,13 +653,14 @@ export default function App() {
                 <span className="list-count">{total.toLocaleString()}</span>
               </h1>
               <button
+                ref={sidebarToggleRef}
                 type="button"
                 className="sidebar-toggle"
-                onClick={() => setSidebarOpen((v) => !v)}
+                onClick={() => setSidebarOpen(true)}
                 aria-expanded={sidebarOpen}
                 aria-controls="sidebar"
               >
-                {sidebarOpen ? 'Hide collections & tags' : 'Collections & tags'}
+                Collections &amp; tags
               </button>
             </div>
 
@@ -692,6 +733,7 @@ export default function App() {
             tags={facets.tags}
             activeTag={filters.tag}
             onTagSelect={selectTag}
+            onClose={() => setSidebarOpen(false)}
           />
         )}
         {showSidebar && sidebarOpen && (
@@ -798,7 +840,7 @@ function TopBar({
 // collection tree, and the tag list. Tags come from the AI tagger.
 function Sidebar({
   tree, uncategorizedCount, libraryTotal, scope, onScopeChange, onCategoriesChanged,
-  tags, activeTag, onTagSelect,
+  tags, activeTag, onTagSelect, onClose,
 }: {
   tree: CategoryNode[];
   uncategorizedCount: number;
@@ -809,6 +851,7 @@ function Sidebar({
   tags: FacetsPayload['tags'];
   activeTag: string | null;
   onTagSelect: (tag: string | null) => void;
+  onClose: () => void;
 }) {
   const [creatingUnder, setCreatingUnder] = useState<number | null | 'root-requested'>(null);
   const [newName, setNewName] = useState('');
@@ -881,6 +924,10 @@ function Sidebar({
 
   return (
     <aside className="sidebar" id="sidebar" aria-label="Collections and tags">
+      {/* Drawer-only (narrow screens); hidden by CSS when the sidebar is a column. */}
+      <button type="button" className="sidebar-close" onClick={onClose}>
+        Close
+      </button>
       <nav className="sidebar-nav" aria-label="Library">
         <button
           className={`sidebar-item${scope.kind === 'all' ? ' active' : ''}`}
@@ -3064,8 +3111,11 @@ interface ChatSource {
 }
 
 // Answer panel for a question asked from the top search box. Keyed on the
-// question by the parent, so each new question mounts a fresh panel.
-function ChatPanel({ question, onClose }: { question: string; onClose: () => void }) {
+// submission id by the parent, so every ask (including a retry of the same
+// text) mounts a fresh panel and request.
+function ChatPanel({
+  question, onRetry, onClose,
+}: { question: string; onRetry: () => void; onClose: () => void }) {
   const [answer, setAnswer] = useState<string>('');
   const [sources, setSources] = useState<ChatSource[]>([]);
   const [asking, setAsking] = useState(true);
@@ -3106,7 +3156,12 @@ function ChatPanel({ question, onClose }: { question: string; onClose: () => voi
         <button type="button" className="link-btn" onClick={onClose} aria-label="Close answer">close</button>
       </div>
       {asking && <p className="chat-status">Reading your library…</p>}
-      {err && <p className="chat-error">Couldn't answer: {err}</p>}
+      {err && (
+        <p className="chat-error">
+          Couldn't answer: {err}{' '}
+          <button type="button" className="link-btn" onClick={onRetry}>Try again</button>
+        </p>
+      )}
       {answer && <ChatAnswer answer={answer} sources={sources} />}
     </section>
   );

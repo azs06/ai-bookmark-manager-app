@@ -357,7 +357,7 @@ app.get('/:id{[0-9]+}', async (c) => {
       SELECT id, url, title, note, og_image_url, domain,
              ai_summary, ai_tags, category_id, importance, status,
              content_type, metadata, short_code, click_count, shortened_at,
-             created_at
+             created_at, last_viewed_at
       FROM bookmarks
       WHERE id = ?
     `)

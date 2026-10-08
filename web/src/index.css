@@ -195,6 +195,7 @@ body {
   padding-bottom: 12px;
 }
 .sidebar-backdrop { display: none; }
+.sidebar-close { display: none; }
 
 .sidebar-nav { display: flex; flex-direction: column; }
 
@@ -1662,6 +1663,17 @@ section h2 {
     background: var(--bg);
     border-left: 1px solid var(--border);
     box-shadow: -8px 0 32px rgba(0, 0, 0, 0.18);
+  }
+  .app-body.sidebar-open .sidebar-close {
+    display: block;
+    margin: 0 0 12px auto;
+    font: inherit;
+    font-size: 13px;
+    color: var(--accent);
+    background: none;
+    border: 0;
+    padding: 2px 0;
+    cursor: pointer;
   }
   .app-body.sidebar-open .sidebar-backdrop {
     display: block;
