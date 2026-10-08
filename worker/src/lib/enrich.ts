@@ -2,6 +2,7 @@ import type { Env } from '../types';
 import { HaikuRefusalError, summarizeAndTag } from './haiku';
 import { summarizeAndTagGemma } from './gemma';
 import { embedAndUpsert } from './vector';
+import { classifyEnrichError, type EnrichFailure } from './enrichFailure';
 import type { SummarizeInput, SummaryResult } from './prompts';
 import { detectYouTube, fetchTranscript, fetchYouTubeMetadata } from './youtube';
 import { detectX, fetchXPostData, type XHit } from './x';
@@ -36,12 +37,15 @@ export async function enrich(
     let summary: string | null = null;
     let summarySource: string | null = null;
     let tags: string[] = [];
+    let aiFailed = false;
     if (extract.summarizeInput) {
       const ai = await summarizeWithFallback(env, extract.summarizeInput);
       if (ai) {
         summary = ai.result.summary || null;
         summarySource = ai.source;
         tags = ai.result.tags;
+      } else {
+        aiFailed = true;
       }
     }
 
@@ -65,6 +69,14 @@ export async function enrich(
       ? 'on-device'
       : summarySource ?? (summary ? 'extract' : null);
     const finalMetadata = mergeSummarySource(extract.metadata, finalSource);
+    // No summary despite a successful fetch: record why, so the retry pass
+    // knows whether trying again could help (AI outage) or not (empty page).
+    if (!finalSummary) {
+      const failure: EnrichFailure = aiFailed
+        ? { kind: 'temporary', detail: 'both AI models failed', at: Date.now() }
+        : { kind: 'no-summary', detail: 'page had nothing to summarize', at: Date.now() };
+      finalMetadata.enrich_error = failure;
+    }
 
     await env.DB.prepare(`
       UPDATE bookmarks
@@ -77,6 +89,9 @@ export async function enrich(
           content_type    = ?,
           metadata        = ?,
           status          = ?,
+          -- the page loaded, so a stale 404/410 from an earlier failure no
+          -- longer belongs in the URL-health dead list
+          http_status     = CASE WHEN http_status IN (404, 410) THEN NULL ELSE http_status END,
           updated_at      = ?
       WHERE id = ?
     `).bind(
@@ -111,10 +126,31 @@ export async function enrich(
       }
     }
   } catch (err) {
-    console.error('enrich failed', err);
+    const failure: EnrichFailure = { ...classifyEnrichError(err), at: Date.now() };
+    console.error('enrich failed', failure.kind, err);
+    // Keep existing metadata; add the failure. An HTTP status also goes to
+    // http_status, so a 404/410 shows up in Settings > URL health's dead list.
     await env.DB
-      .prepare(`UPDATE bookmarks SET status = 'partial', updated_at = ? WHERE id = ?`)
-      .bind(Date.now(), bookmarkId)
+      .prepare(`
+        UPDATE bookmarks
+        SET status          = 'partial',
+            metadata        = json_set(
+                                CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                                '$.enrich_error', json(?)
+                              ),
+            http_status     = COALESCE(?, http_status),
+            last_checked_at = CASE WHEN ? IS NULL THEN last_checked_at ELSE ? END,
+            updated_at      = ?
+        WHERE id = ?
+      `)
+      .bind(
+        JSON.stringify(failure),
+        failure.status ?? null,
+        failure.status ?? null,
+        failure.at,
+        failure.at,
+        bookmarkId,
+      )
       .run();
   }
 }

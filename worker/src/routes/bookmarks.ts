@@ -5,6 +5,7 @@ import { enrich } from '../lib/enrich';
 import { deleteEmbedding, embedAndUpsert } from '../lib/vector';
 import { detectReddit, fetchRedditPost, type RedditPostData } from '../lib/reddit';
 import { probeUrl } from '../lib/health';
+import { RETRYABLE_KINDS } from '../lib/enrichFailure';
 import { assignShortCode, buildShortUrl, generateShortCode, validateAlias } from '../lib/shortlinks';
 import { createOrRestoreBookmark } from '../lib/createBookmark';
 import { HaikuRefusalError, summarizeAndTag } from '../lib/haiku';
@@ -853,26 +854,32 @@ app.post('/:id/watched', async (c) => {
 // Two sets:
 // - default: bookmarks imported (extension / bulk import) or stuck 'pending'.
 //   Enrichment moves them out of the set, so "loop until remaining = 0" ends.
-// - ?scope=partial: bookmarks enriched before but left without a summary.
-//   A failed retry leaves them 'partial', so this set needs a cursor: the
-//   client passes `since` (when its sweep started) and each call claims its
-//   rows by bumping updated_at, so a row is tried at most once per sweep —
-//   including rows still being processed when the next call arrives.
+// - ?scope=partial: bookmarks left without a summary whose recorded failure
+//   is worth retrying (temporary, or never recorded — see enrichFailure.ts).
+//   A failed retry can leave them partial, so this set needs a cursor: the
+//   first call starts a pass and returns `since` (server time, so a client
+//   with a fast clock can't make the pass re-pick rows); later calls send it
+//   back. Each call claims its rows by bumping updated_at, so a row is tried
+//   at most once per pass — including rows still in flight.
 const BATCH_DEFAULT = 20;
 const BATCH_MAX = 50;
 const BATCH_CONCURRENCY = 4;
 
 const BACKLOG_WHERE = `status IN ('imported', 'pending')`;
-const PARTIAL_WHERE = `status = 'partial' AND updated_at < ?`;
+// metadata.enrich_error.kind, or 'unrecorded' — json_valid guards a malformed blob.
+const FAILURE_KIND = `COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.enrich_error.kind') END, 'unrecorded')`;
+const RETRYABLE_PARTIAL_WHERE = `status = 'partial' AND ${FAILURE_KIND} IN (${
+  [...RETRYABLE_KINDS, 'unrecorded'].map((k) => `'${k}'`).join(', ')
+})`;
 
 app.post('/enrich-imported', async (c) => {
   const requested = Number(c.req.query('limit') ?? BATCH_DEFAULT);
   const limit = Math.min(Math.max(Number.isFinite(requested) ? requested : BATCH_DEFAULT, 1), BATCH_MAX);
 
   const partial = c.req.query('scope') === 'partial';
-  const since = Number(c.req.query('since'));
-  if (partial && !Number.isFinite(since)) return c.json({ error: 'since required for scope=partial' }, 400);
-  const where = partial ? PARTIAL_WHERE : BACKLOG_WHERE;
+  const sinceParam = Number(c.req.query('since'));
+  const since = partial && Number.isFinite(sinceParam) && sinceParam > 0 ? sinceParam : Date.now();
+  const where = partial ? `${RETRYABLE_PARTIAL_WHERE} AND updated_at < ?` : BACKLOG_WHERE;
   const whereParams = partial ? [since] : [];
 
   const rows = await c.env.DB
@@ -907,15 +914,23 @@ app.post('/enrich-imported', async (c) => {
   return c.json({
     queued: ids.length,
     remaining: Math.max(0, totalBefore - ids.length),
+    ...(partial ? { since } : {}),
   });
 });
 
+// Backlog size plus a breakdown of bookmarks without a summary by why their
+// last enrichment failed (kinds from enrichFailure.ts, or 'unrecorded').
 app.get('/pending-count', async (c) => {
-  const [backlog, partial] = await Promise.all([
+  const [backlog, partialKinds] = await Promise.all([
     c.env.DB.prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE ${BACKLOG_WHERE}`).first<{ n: number }>(),
-    c.env.DB.prepare(`SELECT COUNT(*) AS n FROM bookmarks WHERE status = 'partial'`).first<{ n: number }>(),
+    c.env.DB
+      .prepare(`SELECT ${FAILURE_KIND} AS kind, COUNT(*) AS n FROM bookmarks WHERE status = 'partial' GROUP BY kind`)
+      .all<{ kind: string; n: number }>(),
   ]);
-  return c.json({ pending: backlog?.n ?? 0, partial: partial?.n ?? 0 });
+  const byKind = Object.fromEntries((partialKinds.results ?? []).map((r) => [r.kind, r.n]));
+  const partial = Object.values(byKind).reduce((a, b) => a + b, 0);
+  const retryable = [...RETRYABLE_KINDS, 'unrecorded'].reduce((a, k) => a + (byKind[k] ?? 0), 0);
+  return c.json({ pending: backlog?.n ?? 0, partial, retryable, partialByKind: byKind });
 });
 
 // URL-health scanner. Probes up to `limit` non-archived bookmarks per call;

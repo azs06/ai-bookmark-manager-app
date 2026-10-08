@@ -468,6 +468,23 @@ body {
   flex-direction: column;
   gap: 12px;
 }
+.enrichment-pass-result { color: var(--text); }
+.enrichment-kinds {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+}
+.enrichment-kind-count {
+  display: inline-block;
+  min-width: 3.5ch;
+  margin-right: 8px;
+  text-align: right;
+  font: 12px var(--font-mono);
+  color: var(--text);
+}
+
 .enrichment-panel-intro {
   display: flex;
   flex-direction: column;
