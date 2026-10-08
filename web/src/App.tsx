@@ -1829,6 +1829,13 @@ marked.use({
   },
 });
 
+// Records an open so daily picks can tell "long-unopened" from "just read".
+// Fire-and-forget: keepalive lets the request outlive a click that opens a
+// new tab, and a failure only costs one data point.
+function markViewed(id: number) {
+  void fetch(`/api/bookmarks/${id}/viewed`, { method: 'POST', keepalive: true }).catch(() => {});
+}
+
 function ReaderView({ bookmarkId }: { bookmarkId: number }) {
   const [bookmark, setBookmark] = useState<ReaderBookmark | null>(null);
   const [state, setState] = useState<FetchState>({ phase: 'loading' });
@@ -1837,6 +1844,8 @@ function ReaderView({ bookmarkId }: { bookmarkId: number }) {
   useEffect(() => {
     document.title = 'Reader — AI Bookmarks';
   }, []);
+
+  useEffect(() => { markViewed(bookmarkId); }, [bookmarkId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2025,6 +2034,8 @@ function BookmarkCard({
   b, categories, onReenriched, onUpdate, onDelete, onToggleWatched,
 }: { b: Bookmark } & CardHandlers) {
   const [busy, setBusy] = useState(false);
+  const [oracleBusy, setOracleBusy] = useState(false);
+  const [oracleHint, setOracleHint] = useState<string | null>(null);
   const [shortCode, setShortCode] = useState<string | null>(b.short_code);
   const [copyHint, setCopyHint] = useState<string | null>(null);
   const [statsOpen, setStatsOpen] = useState(false);
@@ -2069,6 +2080,29 @@ function BookmarkCard({
     setTimeout(async () => { await onReenriched(b.id); setBusy(false); }, 3500);
   };
 
+  // "Call the Oracle": opt-in Haiku summary. Synchronous unlike re-enrich, so
+  // we can show the new summary immediately by refetching the row on success.
+  // Errors get a brief inline hint rather than a global toast — the user is
+  // standing right there clicking the button.
+  const callOracle = async () => {
+    setOracleBusy(true);
+    setOracleHint(null);
+    try {
+      const r = await fetch(`/api/bookmarks/${b.id}/detailed-summary`, { method: 'POST' });
+      if (!r.ok) {
+        const msg = await r.json().catch(() => null) as { error?: string } | null;
+        throw new Error(msg?.error ?? `HTTP ${r.status}`);
+      }
+      await onReenriched(b.id);
+      setOracleHint('Oracle ✓');
+    } catch (err) {
+      setOracleHint((err as Error).message || 'Oracle failed');
+    } finally {
+      setOracleBusy(false);
+      setTimeout(() => setOracleHint(null), 2500);
+    }
+  };
+
   const cycleImportance = () => {
     const next = ((b.importance + 1) % 3) as 0 | 1 | 2;
     void onUpdate(b.id, { importance: next });
@@ -2096,7 +2130,14 @@ function BookmarkCard({
   return (
     <div className={`bookmark${pinnedClass}${videoClass}${xPostClass}${watchedClass}`}>
       {b.og_image_url && (
-        <a href={b.url} target="_blank" rel="noreferrer" className="bookmark-thumb">
+        <a
+          href={b.url}
+          target="_blank"
+          rel="noreferrer"
+          className="bookmark-thumb"
+          onClick={() => markViewed(b.id)}
+          onAuxClick={(e) => { if (e.button === 1) markViewed(b.id); }}
+        >
           <img src={b.og_image_url} alt="" />
           {isVideo && <span className="play-overlay" aria-hidden>▶</span>}
           {isXPost && <span className="play-overlay" aria-hidden>𝕏</span>}
@@ -2104,7 +2145,16 @@ function BookmarkCard({
         </a>
       )}
       <div className="bookmark-body">
-        <a href={b.url} target="_blank" rel="noreferrer" className="title">{b.title ?? b.url}</a>
+        <a
+          href={b.url}
+          target="_blank"
+          rel="noreferrer"
+          className="title"
+          onClick={() => markViewed(b.id)}
+          onAuxClick={(e) => { if (e.button === 1) markViewed(b.id); }}
+        >
+          {b.title ?? b.url}
+        </a>
         <div className="domain">
           {xPost?.handle ? (
             <span className="channel">@{xPost.handle}</span>
@@ -2189,6 +2239,18 @@ function BookmarkCard({
             </svg>
           </a>
         )}
+        {b.ai_summary && (
+          <button
+            className="icon-btn oracle-btn"
+            onClick={callOracle}
+            disabled={oracleBusy}
+            title="Call the Oracle: regenerate this summary with Haiku"
+            aria-label="Call the Oracle"
+          >
+            {oracleBusy ? '…' : '🔮'}
+          </button>
+        )}
+        {oracleHint && <span className="copy-hint" role="status">{oracleHint}</span>}
         <button
           className="icon-btn reenrich-btn"
           onClick={reenrich}

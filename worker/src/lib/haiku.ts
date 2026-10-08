@@ -36,7 +36,15 @@ interface MessagesResponse {
 
 async function callHaiku(
   env: Env,
-  req: { system: string; user: string; maxTokens: number; effort: HaikuEffort },
+  req: {
+    system: string;
+    user: string;
+    maxTokens: number;
+    effort: HaikuEffort;
+    // Structured outputs: the API guarantees the reply parses against this
+    // schema, so JSON routes can't come back as prose or half-fenced JSON.
+    schema?: Record<string, unknown>;
+  },
 ): Promise<string> {
   if (!env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not configured');
 
@@ -50,7 +58,10 @@ async function callHaiku(
     body: JSON.stringify({
       model: HAIKU_MODEL,
       max_tokens: req.maxTokens,
-      output_config: { effort: req.effort },
+      output_config: {
+        effort: req.effort,
+        ...(req.schema && { format: { type: 'json_schema', schema: req.schema } }),
+      },
       system: req.system,
       messages: [{ role: 'user', content: req.user }],
     }),
@@ -63,6 +74,7 @@ async function callHaiku(
 // Responses can lead with thinking blocks, so pick the text block by type.
 // A response that hit max_tokens is incomplete (truncated JSON, cut-off chat
 // answer) — fail loudly rather than hand callers a partial string.
+// These are also the two cases where structured output may not match the schema.
 function readText(data: MessagesResponse): string {
   if (data.stop_reason === 'refusal') {
     throw new HaikuRefusalError(data.stop_details?.category ?? null);
@@ -73,16 +85,48 @@ function readText(data: MessagesResponse): string {
   return data.content.find((c) => c.type === 'text')?.text ?? '';
 }
 
+// Structured-output schemas: every object needs additionalProperties: false,
+// and length/count constraints (minItems, maxLength…) aren't supported — the
+// prompts carry those rules instead.
+const SUMMARY_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    tags: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['summary', 'tags'],
+  additionalProperties: false,
+};
+
+const PICKS_SCHEMA = {
+  type: 'object',
+  properties: {
+    picks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { id: { type: 'integer' }, reason: { type: 'string' } },
+        required: ['id', 'reason'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['picks'],
+  additionalProperties: false,
+};
+
 export async function summarizeAndTag(
   env: Env,
   input: SummarizeInput,
   opts: { effort?: HaikuEffort } = {},
 ): Promise<SummaryResult> {
   const text = await callHaiku(env, {
-    system: pickSystemPrompt(input.kind),
+    system: pickSystemPrompt(input.kind, input.detail),
     user: buildSummarizeUserMessage(input),
-    maxTokens: 1024,
+    // Detailed runs think more (Oracle uses 'medium') and write more.
+    maxTokens: input.detail === 'detailed' ? 2048 : 1024,
     effort: opts.effort ?? 'low',
+    schema: SUMMARY_SCHEMA,
   });
   return parseSummarizeTagJson(text);
 }
@@ -98,11 +142,12 @@ export interface PickCandidate {
   tags: string[];
   importance: number;
   age_days: number;
+  days_since_viewed: number | null;  // null = no recorded open
 }
 
 export interface Pick { id: number; reason: string; }
 
-const PICK_SYSTEM_PROMPT = `You curate a daily shortlist from a personal bookmark library. From the candidates given, pick 3-5 that the user is most likely to act on today — balance long-unopened but high-importance items with recent saves they likely want to revisit. Return STRICT JSON only:
+const PICK_SYSTEM_PROMPT = `You curate a daily shortlist from a personal bookmark library. From the candidates given, pick 3-5 that the user is most likely to act on today — balance long-unopened but high-importance items with recent saves they likely want to revisit. Each candidate shows how old it is and when it was last opened. Open tracking started recently, so "never opened" on an older save is weak evidence — weigh it lightly. Return STRICT JSON only:
 {"picks": [{"id": 123, "reason": "one-sentence reason, max 15 words"}]}
 
 Rules:
@@ -121,6 +166,7 @@ export async function suggestTopPicks(
     user: formatCandidates(candidates),
     maxTokens: 1024,
     effort: 'low',
+    schema: PICKS_SCHEMA,
   });
   return parsePicks(text, new Set(candidates.map((c) => c.id)));
 }
@@ -130,7 +176,8 @@ function formatCandidates(candidates: PickCandidate[]): string {
     const importanceLabel = c.importance === 2 ? 'pinned' : c.importance === 1 ? 'important' : 'normal';
     const tags = c.tags.length ? ` tags=[${c.tags.join(', ')}]` : '';
     const summary = c.summary ? ` — ${c.summary}` : '';
-    return `#${c.id} (${importanceLabel}, ${c.age_days}d old)${tags}: ${c.title ?? '(no title)'}${summary}`;
+    const viewed = c.days_since_viewed === null ? 'never opened' : `opened ${c.days_since_viewed}d ago`;
+    return `#${c.id} (${importanceLabel}, ${c.age_days}d old, ${viewed})${tags}: ${c.title ?? '(no title)'}${summary}`;
   });
   return `Candidates:\n${lines.join('\n')}`;
 }
@@ -162,6 +209,7 @@ export interface ChatContext {
   title: string | null;
   url: string;
   summary: string | null;
+  excerpt: string | null;
   tags: string[];
 }
 
@@ -196,7 +244,10 @@ function formatChatMessage(question: string, context: ChatContext[]): string {
   const blocks = context.map((c) => {
     const tags = c.tags.length ? `\nTags: ${c.tags.join(', ')}` : '';
     const summary = c.summary ? `\nSummary: ${c.summary}` : '';
-    return `[#${c.id}] ${c.title ?? c.url}\nURL: ${c.url}${tags}${summary}`;
+    // The stored excerpt (≤3000 chars) lets answers go past what a 1-2
+    // sentence summary says. X posts store the same text as both — skip it.
+    const excerpt = c.excerpt && c.excerpt !== c.summary ? `\nExcerpt: ${c.excerpt}` : '';
+    return `[#${c.id}] ${c.title ?? c.url}\nURL: ${c.url}${tags}${summary}${excerpt}`;
   });
   return `Question: ${question}\n\nContext bookmarks:\n${blocks.join('\n\n')}`;
 }

@@ -5,21 +5,35 @@ export interface SummaryResult {
 
 export type ContentKind = 'article' | 'video';
 
+// 'detailed' is the Oracle: longer summary over fuller source text.
+export type SummaryDetail = 'brief' | 'detailed';
+
 export interface SummarizeInput {
   title?: string;
   excerpt: string;
   kind?: ContentKind;
   channel?: string;    // videos: author/creator name
   durationSec?: number; // videos: duration in seconds
+  detail?: SummaryDetail; // default 'brief'
 }
 
-export const SUMMARIZE_TAG_SYSTEM_PROMPT = `You catalogue web pages into a personal bookmark library. For each page you receive, return a neutral summary and topical tags as STRICT JSON.
+const ARTICLE_SUMMARY_RULE: Record<SummaryDetail, string> = {
+  brief: '1-2 sentences. Describe what the page is about and why it might be worth revisiting.',
+  detailed: '3-4 sentences. Cover the main points, arguments or findings, and why it might be worth revisiting.',
+};
+
+const VIDEO_SUMMARY_RULE: Record<SummaryDetail, string> = {
+  brief: '1-2 sentences. Describe what the video *covers* — the topics, techniques, or arguments presented — not the channel\'s style.',
+  detailed: '3-4 sentences. Describe what the video *covers* — the main topics, techniques, arguments and conclusions — not the channel\'s style.',
+};
+
+const articlePrompt = (detail: SummaryDetail) => `You catalogue web pages into a personal bookmark library. For each page you receive, return a neutral summary and topical tags as STRICT JSON.
 
 Output format (no code fences, no commentary, no leading text):
 {"summary": "...", "tags": ["tag1", "tag2"]}
 
 Rules:
-- summary: 1-2 sentences. Describe what the page is about and why it might be worth revisiting. Neutral, concrete voice — no marketing language, no "this article…".
+- summary: ${ARTICLE_SUMMARY_RULE[detail]} Neutral, concrete voice — no marketing language, no "this article…".
 - tags: 3-5 items, lowercase, kebab-case for multi-word (e.g. "llm-evals"). Mix topical tags ("rust", "database-internals") with resource-type tags ("tutorial", "benchmark", "essay", "docs"). Avoid generic tags like "article", "web", "technology".
 - If the excerpt is clearly junk (paywall, error page, navigation only), return {"summary": "", "tags": []}.`;
 
@@ -27,19 +41,19 @@ Rules:
 // the excerpt here is usually a transcript — very chatty, lots of filler.
 // We want the summary to describe what the *video* covers (not the
 // transcript's surface content) and the tags to include a video-kind tag.
-export const SUMMARIZE_VIDEO_SYSTEM_PROMPT = `You catalogue YouTube videos into a personal bookmark library. You receive a video's title, channel, duration, and a (possibly auto-generated) transcript excerpt. Return a neutral summary and topical tags as STRICT JSON.
+const videoPrompt = (detail: SummaryDetail) => `You catalogue YouTube videos into a personal bookmark library. You receive a video's title, channel, duration, and a (possibly auto-generated) transcript excerpt. Return a neutral summary and topical tags as STRICT JSON.
 
 Output format (no code fences, no commentary, no leading text):
 {"summary": "...", "tags": ["tag1", "tag2"]}
 
 Rules:
-- summary: 1-2 sentences. Describe what the video *covers* — the topics, techniques, or arguments presented — not the channel's style. Neutral, concrete voice — no "in this video…" or "the speaker…". Lead with the subject matter.
+- summary: ${VIDEO_SUMMARY_RULE[detail]} Neutral, concrete voice — no "in this video…" or "the speaker…". Lead with the subject matter.
 - tags: 3-5 items, lowercase, kebab-case for multi-word. Mix topical tags with a video-kind tag from: "tutorial", "talk", "explainer", "interview", "review", "walkthrough", "demo", "vlog". Always include one kind tag. Avoid "video", "youtube".
 - Transcripts from auto-captions may have typos, filler words, and missing punctuation — infer the actual topic rather than echoing exact phrases.
 - If the transcript is empty, junk, or non-informative, return {"summary": "", "tags": []}.`;
 
-export function pickSystemPrompt(kind: ContentKind | undefined): string {
-  return kind === 'video' ? SUMMARIZE_VIDEO_SYSTEM_PROMPT : SUMMARIZE_TAG_SYSTEM_PROMPT;
+export function pickSystemPrompt(kind: ContentKind | undefined, detail: SummaryDetail = 'brief'): string {
+  return kind === 'video' ? videoPrompt(detail) : articlePrompt(detail);
 }
 
 export function buildSummarizeUserMessage(input: SummarizeInput): string {

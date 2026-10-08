@@ -2,6 +2,9 @@ export interface Env extends Cloudflare.Env {
   ALLOWED_ORIGINS?: string;
   ALLOWED_EXTENSION_ORIGINS?: string;
   ANTHROPIC_API_KEY?: string;
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_WEBHOOK_SECRET?: string;
+  TELEGRAM_ALLOWED_CHAT_ID?: string;
 }
 
 export type BookmarkStatus =

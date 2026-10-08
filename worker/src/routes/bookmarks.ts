@@ -3,136 +3,75 @@ import type { BookmarkStatus, Env } from '../types';
 import { hashUrl, normalizeUrl } from '../lib/url';
 import { enrich } from '../lib/enrich';
 import { deleteEmbedding, embedAndUpsert } from '../lib/vector';
-import { detectYouTube } from '../lib/youtube';
-import { detectX } from '../lib/x';
 import { detectReddit, fetchRedditPost, type RedditPostData } from '../lib/reddit';
 import { probeUrl } from '../lib/health';
 import { assignShortCode, buildShortUrl, generateShortCode, validateAlias } from '../lib/shortlinks';
+import { createOrRestoreBookmark } from '../lib/createBookmark';
+import { HaikuRefusalError, summarizeAndTag } from '../lib/haiku';
 
 const app = new Hono<{ Bindings: Env }>();
 
-interface ExistingBookmark {
-  id: number;
-  status: BookmarkStatus;
-  title: string | null;
-  note: string;
-  ai_summary: string | null;
-  ai_tags: string;
-  content_excerpt: string | null;
-  short_code: string | null;
-}
-
 app.post('/', async (c) => {
-  const body = await c.req.json<{ url?: string; title?: string; note?: string; auto_shorten?: boolean }>();
+  const body = await c.req.json<{
+    url?: string;
+    title?: string;
+    note?: string;
+    auto_shorten?: boolean;
+    ai_summary?: string;
+    summary_source?: string;
+  }>();
   if (!body.url) return c.json({ error: 'url required' }, 400);
 
-  const normalized = normalizeUrl(body.url);
-  const urlHash = await hashUrl(normalized);
-  const domain = new URL(normalized).hostname;
-  const now = Date.now();
   const wantsShorten = body.auto_shorten === true;
+  // Only trust 'on-device' as a source coming from a client; backend-produced
+  // sources ('gemma', 'haiku-auto', 'haiku-detailed') are stamped server-side.
+  const clientSummary = body.ai_summary && body.summary_source === 'on-device'
+    ? { ai_summary: body.ai_summary.trim(), summary_source: 'on-device' as const }
+    : null;
 
-  const existing = await c.env.DB
-    .prepare(`
-      SELECT id, status, title, note, ai_summary, ai_tags, content_excerpt, short_code
-      FROM bookmarks
-      WHERE url_hash = ?
-    `)
-    .bind(urlHash)
-    .first<ExistingBookmark>();
+  const result = await createOrRestoreBookmark(c.env, c.executionCtx, {
+    url: body.url,
+    title: body.title,
+    note: body.note,
+    ...(clientSummary ?? {}),
+  });
 
-  if (existing) {
-    if (existing.status === 'archived') {
-      const restoredStatus = deriveRestoredStatus(existing);
-      const restoredTitle = body.title ?? existing.title;
-      const restoredNote = body.note ?? existing.note;
-
-      await c.env.DB
-        .prepare(`
-          UPDATE bookmarks
-          SET title = ?, note = ?, status = ?, updated_at = ?
-          WHERE id = ?
-        `)
-        .bind(restoredTitle, restoredNote, restoredStatus, now, existing.id)
-        .run();
-
-      c.executionCtx.waitUntil(
-        repairRestoredBookmark(c.env, {
-          ...existing,
-          title: restoredTitle,
-          note: restoredNote,
-          status: restoredStatus,
-        }).catch((err) => {
-          console.error('restore repair failed', err);
-        }),
-      );
-
-      const shortFields = wantsShorten
-        ? await mintShortFields(c.env, existing.id, c.req.url)
-        : null;
-
-      return c.json({
-        id: existing.id,
-        duplicate: false,
-        restored: true,
-        status: restoredStatus,
-        ...(shortFields ?? {}),
-      });
-    }
-
-    await c.env.DB
-      .prepare('UPDATE bookmarks SET updated_at = ? WHERE id = ?')
-      .bind(now, existing.id)
-      .run();
-
+  if (result.kind === 'restored') {
     const shortFields = wantsShorten
-      ? existing.short_code
-        ? { short_code: existing.short_code, short_url: buildShortUrl(c.req.url, existing.short_code) }
-        : await mintShortFields(c.env, existing.id, c.req.url)
+      ? await mintShortFields(c.env, result.id, c.req.url)
       : null;
-
     return c.json({
-      id: existing.id,
-      duplicate: true,
-      status: existing.status,
+      id: result.id,
+      duplicate: false,
+      restored: true,
+      status: result.status,
       ...(shortFields ?? {}),
     });
   }
 
-  // Stamp content_type + minimal metadata at insert time so the list view
-  // can show "Videos (N)" counts and a play-icon placeholder while the
-  // async enricher is still running. enrich() will overwrite metadata with
-  // richer fields (channel, duration, publishedAt) when it finishes.
-  const yt = detectYouTube(normalized);
-  const xPost = !yt ? detectX(normalized) : null;
-  const contentType = yt ? 'video' : xPost ? 'x' : null;
-  const initialMetadata = yt
-    ? JSON.stringify({ videoId: yt.videoId })
-    : xPost
-      ? JSON.stringify({ statusId: xPost.statusId, ...(xPost.user ? { handle: xPost.user } : {}) })
-      : '{}';
-
-  const result = await c.env.DB
-    .prepare(`
-      INSERT INTO bookmarks (url, url_hash, title, note, domain, content_type, metadata, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-    `)
-    .bind(normalized, urlHash, body.title ?? null, body.note ?? '', domain, contentType, initialMetadata, now, now)
-    .run();
-
-  const id = result.meta.last_row_id as number;
-
-  c.executionCtx.waitUntil(enrich(c.env, id));
+  if (result.kind === 'duplicate') {
+    const shortFields = wantsShorten
+      ? result.existing.short_code
+        ? { short_code: result.existing.short_code, short_url: buildShortUrl(c.req.url, result.existing.short_code) }
+        : await mintShortFields(c.env, result.id, c.req.url)
+      : null;
+    return c.json({
+      id: result.id,
+      duplicate: true,
+      status: result.status,
+      ...(shortFields ?? {}),
+    });
+  }
 
   const shortFields = wantsShorten
-    ? await mintShortFields(c.env, id, c.req.url)
+    ? await mintShortFields(c.env, result.id, c.req.url)
     : null;
 
   return c.json({
-    id,
+    id: result.id,
     duplicate: false,
-    status: 'pending',
-    content_type: contentType,
+    status: result.status,
+    content_type: result.contentType,
     ...(shortFields ?? {}),
   });
 });
@@ -595,6 +534,131 @@ app.post('/import', async (c) => {
   }
 
   return c.json({ imported, skipped, errors });
+});
+
+// "Call the Oracle": user-triggered detailed summary. Whatever's in
+// ai_summary today gets replaced with a longer Haiku summary at higher
+// effort, over the full page text (cached markdown, fetched and cached on a
+// miss) rather than the 3000-char excerpt the automatic tier sees. Videos and
+// X posts have no markdown, so they still use the stored excerpt/transcript.
+// Synchronous so the UI shows the new summary immediately.
+const ORACLE_MAX_CHARS = 40_000;  // ~13K tokens; ≈$0.001 per click
+
+app.post('/:id{[0-9]+}/detailed-summary', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (!Number.isFinite(id)) return c.json({ error: 'invalid id' }, 400);
+
+  const row = await c.env.DB
+    .prepare(`
+      SELECT id, url, title, content_excerpt, content_type, metadata, markdown_cached
+      FROM bookmarks WHERE id = ?
+    `)
+    .bind(id)
+    .first<{
+      id: number;
+      url: string;
+      title: string | null;
+      content_excerpt: string | null;
+      content_type: string | null;
+      metadata: string;
+      markdown_cached: string | null;
+    }>();
+  if (!row) return c.json({ error: 'not found' }, 404);
+
+  const sourceText = await loadOracleText(c.env, row);
+  if (!sourceText) {
+    return c.json({
+      error: 'No extracted content yet — try Re-enrich first, then call the Oracle.',
+    }, 400);
+  }
+
+  let result;
+  try {
+    result = await summarizeAndTag(c.env, {
+      title: row.title ?? undefined,
+      excerpt: sourceText.slice(0, ORACLE_MAX_CHARS),
+      kind: row.content_type === 'video' ? 'video' : 'article',
+      detail: 'detailed',
+    }, { effort: 'medium' });  // explicit click: worth more than the auto tier's 'low'
+  } catch (err) {
+    if (err instanceof HaikuRefusalError) console.warn('oracle:haiku-refusal', err.category);
+    return c.json({ error: (err as Error).message }, 502);
+  }
+
+  const summary = result.summary?.trim() || null;
+  if (!summary) return c.json({ error: 'Oracle returned an empty summary.' }, 502);
+
+  const metadata = mergeOracleMetadata(row.metadata);
+  const now = Date.now();
+
+  await c.env.DB.prepare(`
+    UPDATE bookmarks
+    SET ai_summary = ?, ai_tags = ?, metadata = ?, status = 'active', updated_at = ?
+    WHERE id = ?
+  `).bind(summary, JSON.stringify(result.tags), JSON.stringify(metadata), now, id).run();
+
+  // Re-embed so semantic search reflects the better summary. Don't fail the
+  // request if it errors; the row update already landed.
+  c.executionCtx.waitUntil(
+    embedAndUpsert(c.env, id, {
+      title: row.title,
+      summary,
+      // For tweets the summary already IS the post text; passing the excerpt
+      // again would feed the embedder a duplicated string (mirrors enrich()).
+      excerpt: row.content_type === 'x' ? null : row.content_excerpt,
+    }).catch((err) => console.error('oracle embed failed', err)),
+  );
+
+  return c.json({
+    ok: true,
+    id,
+    summary,
+    tags: result.tags,
+    summary_source: 'haiku-detailed',
+    summary_at: now,
+  });
+});
+
+// Full page text for the Oracle: cached markdown, else fetch-and-cache it the
+// same way the markdown route does, else the stored excerpt. A Jina/origin
+// failure must not fail the Oracle, so every miss falls through.
+async function loadOracleText(
+  env: Env,
+  row: { id: number; url: string; content_type: string | null; content_excerpt: string | null; markdown_cached: string | null },
+): Promise<string | null> {
+  if (row.content_type === 'video' || row.content_type === 'x') return row.content_excerpt;
+  if (row.markdown_cached) return row.markdown_cached;
+
+  try {
+    const result = await fetchMarkdown(row.url);
+    if (result.ok) {
+      const now = Date.now();
+      await env.DB
+        .prepare(`
+          UPDATE bookmarks
+          SET markdown_cached = ?, markdown_cached_at = ?, markdown_source = ?, updated_at = ?
+          WHERE id = ?
+        `)
+        .bind(result.markdown, now, result.source, now, row.id)
+        .run();
+      return result.markdown;
+    }
+  } catch (err) {
+    console.warn('oracle:markdown-fetch-failed', err);
+  }
+  return row.content_excerpt;
+}
+
+// Records that the user opened the bookmark (card link or reader). Feeds the
+// daily picks' "long-unopened" signal. Deliberately leaves updated_at alone:
+// opening isn't an edit and shouldn't reorder anything sorted by it.
+app.post('/:id{[0-9]+}/viewed', async (c) => {
+  const id = Number(c.req.param('id'));
+  await c.env.DB
+    .prepare('UPDATE bookmarks SET last_viewed_at = ? WHERE id = ?')
+    .bind(Date.now(), id)
+    .run();
+  return c.json({ ok: true });
 });
 
 app.post('/:id/re-enrich', async (c) => {
@@ -1175,35 +1239,6 @@ async function runEnrichBatch(env: Env, ids: number[], concurrency: number): Pro
   await Promise.all(workers);
 }
 
-function deriveRestoredStatus(row: Pick<ExistingBookmark, 'ai_summary' | 'ai_tags' | 'content_excerpt'>): BookmarkStatus {
-  if (row.ai_summary) return 'active';
-  if (row.content_excerpt) return 'partial';
-  if (hasStoredTags(row.ai_tags)) return 'imported';
-  return 'pending';
-}
-
-function hasStoredTags(raw: string): boolean {
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) && parsed.some((item) => typeof item === 'string' && item.trim());
-  } catch {
-    return false;
-  }
-}
-
-async function repairRestoredBookmark(env: Env, row: ExistingBookmark): Promise<void> {
-  if (row.ai_summary) {
-    await embedAndUpsert(env, row.id, {
-      title: row.title,
-      summary: row.ai_summary,
-      excerpt: row.content_excerpt,
-    });
-    return;
-  }
-
-  await enrich(env, row.id);
-}
-
 // Reddit JSON → markdown. We render the post (title, OP, body) and the top
 // comments as a blockquote thread so the reader sees discussion context, not
 // just the OP — which is usually what makes a Reddit link worth saving.
@@ -1250,6 +1285,24 @@ function formatRedditMarkdown(d: RedditPostData): string {
   }
 
   return lines.join('\n');
+}
+
+// Merges the existing metadata blob with Oracle-stamped fields, preserving
+// any other keys (videoId, watchedAt, etc.) so this route stays type-agnostic.
+function mergeOracleMetadata(rawMetadata: string | null): Record<string, unknown> {
+  let base: Record<string, unknown> = {};
+  if (rawMetadata) {
+    try {
+      const parsed = JSON.parse(rawMetadata);
+      if (parsed && typeof parsed === 'object') base = parsed as Record<string, unknown>;
+    } catch {
+      // Treat unparseable metadata as empty rather than erroring the route —
+      // the row update will write back valid JSON either way.
+    }
+  }
+  base.summary_source = 'haiku-detailed';
+  base.summary_at = Date.now();
+  return base;
 }
 
 export default app;

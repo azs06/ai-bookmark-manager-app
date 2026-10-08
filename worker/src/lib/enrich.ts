@@ -1,5 +1,5 @@
 import type { Env } from '../types';
-import { summarizeAndTag } from './haiku';
+import { HaikuRefusalError, summarizeAndTag } from './haiku';
 import { summarizeAndTagGemma } from './gemma';
 import { embedAndUpsert } from './vector';
 import type { SummarizeInput, SummaryResult } from './prompts';
@@ -11,23 +11,37 @@ const USER_AGENT = 'Mozilla/5.0 (compatible; AIBookmarks/0.1)';
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_EXCERPT_CHARS = 3000;
 
-export async function enrich(env: Env, bookmarkId: number): Promise<void> {
+export async function enrich(
+  env: Env,
+  bookmarkId: number,
+  opts: { preserveClientSummary?: boolean } = {},
+): Promise<void> {
   const row = await env.DB
-    .prepare('SELECT id, url FROM bookmarks WHERE id = ?')
+    .prepare('SELECT id, url, ai_summary FROM bookmarks WHERE id = ?')
     .bind(bookmarkId)
-    .first<{ id: number; url: string }>();
+    .first<{ id: number; url: string; ai_summary: string | null }>();
   if (!row) return;
+
+  // Preservation is opt-in by the CALLER, never inferred from the row. Only the
+  // first-pass enrich right after an on-device save asks to preserve; an
+  // explicit re-enrich/batch pass omits the flag and regenerates, so a stale or
+  // junk on-device summary can be replaced. (If we sniffed the row's own
+  // summary_source instead, every caller would reach the same verdict and a row
+  // stamped 'on-device' could only ever be fixed by the paid Oracle.)
+  const preserveClientSummary = opts.preserveClientSummary === true && !!row.ai_summary;
 
   try {
     const extract = await extractForEnrichment(row.url);
 
     let summary: string | null = null;
+    let summarySource: string | null = null;
     let tags: string[] = [];
     if (extract.summarizeInput) {
       const ai = await summarizeWithFallback(env, extract.summarizeInput);
       if (ai) {
-        summary = ai.summary || null;
-        tags = ai.tags;
+        summary = ai.result.summary || null;
+        summarySource = ai.source;
+        tags = ai.result.tags;
       }
     }
 
@@ -40,6 +54,17 @@ export async function enrich(env: Env, bookmarkId: number): Promise<void> {
     if (tags.length === 0 && extract.presetTags?.length) {
       tags = extract.presetTags;
     }
+
+    // On-device summary takes precedence on this first pass: the user already
+    // saw it in the popup, so we keep it as the displayed summary and take only
+    // the AI tier's tags + extract metadata. (The model still ran above — we run
+    // it for the tags and discard its summary; the saving is on the later re-enrich
+    // path, which preserves nothing and would otherwise re-summarize.)
+    const finalSummary = preserveClientSummary ? row.ai_summary : summary;
+    const finalSource = preserveClientSummary
+      ? 'on-device'
+      : summarySource ?? (summary ? 'extract' : null);
+    const finalMetadata = mergeSummarySource(extract.metadata, finalSource);
 
     await env.DB.prepare(`
       UPDATE bookmarks
@@ -59,22 +84,22 @@ export async function enrich(env: Env, bookmarkId: number): Promise<void> {
       extract.ogImage,
       extract.ogDescription,
       extract.excerpt,
-      summary,
+      finalSummary,
       JSON.stringify(tags),
       extract.contentType,
-      JSON.stringify(extract.metadata),
-      summary ? 'active' : 'partial',
+      JSON.stringify(finalMetadata),
+      finalSummary ? 'active' : 'partial',
       Date.now(),
       bookmarkId,
     ).run();
 
     // Best-effort vector upsert. Failure here doesn't fail enrichment —
     // the bookmark stays searchable by title/tags even without semantic.
-    if (summary) {
+    if (finalSummary) {
       try {
         await embedAndUpsert(env, bookmarkId, {
           title: extract.title,
-          summary,
+          summary: finalSummary,
           // For tweets, summary IS the tweet text — passing it again as
           // excerpt would feed the embedder a duplicated string and bias
           // the vector toward repeated tokens.
@@ -310,35 +335,50 @@ async function extractPage(url: string): Promise<ExtractedPage> {
   };
 }
 
-// Gemma is ~10× cheaper than Haiku and handles the vast majority of pages
-// fine. When it can't parse or the AI binding errors, fall back to Haiku so
-// the bookmark still gets enriched. Log each branch so fallback rate is
-// observable in `wrangler tail`.
+// Haiku first: summaries feed the search embeddings, Haiku 5.5 follows the
+// prompt more reliably than Gemma with thinking off, structured outputs rule
+// out parse failures, and it costs ~$0.0003 per bookmark. Gemma is the
+// fallback when Haiku errors, refuses, or no API key is configured.
+//
+// A Haiku junk verdict ({summary: '', tags: []}) is accepted, not retried on
+// Gemma: the prompt asks for it on paywalls and error pages, so a retry would
+// only summarize the junk. Log each branch so the mix shows in `wrangler tail`.
 async function summarizeWithFallback(
   env: Env,
   input: SummarizeInput,
-): Promise<SummaryResult | null> {
+): Promise<{ result: SummaryResult; source: 'haiku-auto' | 'gemma' } | null> {
+  if (env.ANTHROPIC_API_KEY) {
+    try {
+      const haiku = await summarizeAndTag(env, input);
+      console.log('enrich:haiku-hit');
+      return { result: haiku, source: 'haiku-auto' };
+    } catch (err) {
+      if (err instanceof HaikuRefusalError) console.warn('enrich:haiku-refusal', err.category);
+      else console.error('haiku failed', err);
+    }
+  }
+
   try {
     const gemma = await summarizeAndTagGemma(env, input);
     if (gemma) {
-      console.log('enrich:gemma-hit');
-      return gemma;
+      console.log('enrich:gemma-fallback');
+      return { result: gemma, source: 'gemma' };
     }
   } catch (err) {
     console.error('gemma failed', err);
   }
 
-  if (!env.ANTHROPIC_API_KEY) {
-    console.error('enrich:both-failed (no ANTHROPIC_API_KEY for Haiku fallback)');
-    return null;
-  }
+  console.error('enrich:both-failed');
+  return null;
+}
 
-  try {
-    const haiku = await summarizeAndTag(env, input);
-    console.log('enrich:haiku-fallback');
-    return haiku;
-  } catch (err) {
-    console.error('enrich:both-failed', err);
-    return null;
-  }
+// enrich() rebuilds metadata from the extract pass; this stamps the
+// summary_source key so downstream code (Oracle button, UI badges) knows
+// which model produced what's in ai_summary right now.
+function mergeSummarySource(
+  extractMetadata: Record<string, unknown>,
+  source: string | null,
+): Record<string, unknown> {
+  if (!source) return extractMetadata;
+  return { ...extractMetadata, summary_source: source, summary_at: Date.now() };
 }

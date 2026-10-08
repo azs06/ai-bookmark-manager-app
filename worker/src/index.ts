@@ -7,6 +7,7 @@ import search from './routes/search';
 import suggestions from './routes/suggestions';
 import chat from './routes/chat';
 import shortlinks, { shortlinkRedirect } from './routes/shortlinks';
+import telegram from './routes/telegram';
 import { runDailySuggestions } from './lib/suggestions';
 import { pollAllFeeds } from './lib/feeds';
 import { resolveAllowedOrigin } from './lib/cors';
@@ -36,6 +37,10 @@ app.route('/api/search', search);
 app.route('/api/suggestions', suggestions);
 app.route('/api/chat', chat);
 app.route('/api/shortlinks', shortlinks);
+// Telegram bot webhook. Public from Telegram's perspective — needs a CF
+// Access "Bypass" app on /api/telegram/webhook in production. Auth is
+// layered inside the route (secret header + chat_id allowlist).
+app.route('/api/telegram', telegram);
 
 // Public short-link redirect. Lives at the root (not under /api) so the URL
 // stays short. Requires a CF Access bypass policy on /s/* in production —
