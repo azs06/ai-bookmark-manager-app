@@ -256,6 +256,7 @@ app.get('/', async (c) => {
     c.req.query('domain'),
     c.req.query('year'),
     c.req.query('content_type'),
+    c.req.query('tag'),
   );
   const finalWhere = filters.clauses.length ? `${where} AND ${filters.clauses.join(' AND ')}` : where;
   const allParams = [...params, ...filters.params];
@@ -271,7 +272,7 @@ app.get('/', async (c) => {
       SELECT b.id, b.url, b.title, b.note, b.og_image_url, b.domain,
              b.ai_summary, b.ai_tags, b.category_id, b.importance, b.status,
              b.content_type, b.metadata, b.short_code, b.click_count,
-             b.created_at
+             b.created_at, b.last_viewed_at
       ${from}
       WHERE ${finalWhere}
       ORDER BY b.importance DESC, b.created_at DESC, b.id DESC
@@ -289,7 +290,7 @@ app.get('/', async (c) => {
 app.get('/facets', async (c) => {
   const { from, where, params } = buildScopedWhere(c.req.query('scope'));
 
-  const [domains, years, contentTypes] = await Promise.all([
+  const [domains, years, contentTypes, tags] = await Promise.all([
     c.env.DB
       .prepare(`
         SELECT b.domain AS name, COUNT(*) AS count
@@ -322,12 +323,25 @@ app.get('/facets', async (c) => {
       `)
       .bind(...params)
       .all<{ name: string; count: number }>(),
+    // Tag cloud for the sidebar: the most-used AI tags in this scope.
+    c.env.DB
+      .prepare(`
+        SELECT t.value AS name, COUNT(*) AS count
+        ${from}, json_each(${SAFE_TAGS_JSON}) t
+        WHERE ${where}
+        GROUP BY t.value
+        ORDER BY count DESC, t.value ASC
+        LIMIT 60
+      `)
+      .bind(...params)
+      .all<{ name: string; count: number }>(),
   ]);
 
   return c.json({
     domains: domains.results ?? [],
     years: years.results ?? [],
     content_types: contentTypes.results ?? [],
+    tags: tags.results ?? [],
   });
 });
 
@@ -343,7 +357,7 @@ app.get('/:id{[0-9]+}', async (c) => {
       SELECT id, url, title, note, og_image_url, domain,
              ai_summary, ai_tags, category_id, importance, status,
              content_type, metadata, short_code, click_count, shortened_at,
-             created_at
+             created_at, last_viewed_at
       FROM bookmarks
       WHERE id = ?
     `)
@@ -1177,7 +1191,11 @@ function buildScopedWhere(scope: string | undefined): {
   return { from, where, params };
 }
 
-// Parses + validates the three filter query params. Unknown/invalid values
+// ai_tags is written as a JSON array, but a malformed value would make
+// json_each() throw and fail the whole query — treat it as no tags instead.
+const SAFE_TAGS_JSON = `CASE WHEN json_valid(b.ai_tags) THEN b.ai_tags ELSE '[]' END`;
+
+// Parses + validates the filter query params. Unknown/invalid values
 // are silently dropped so a malformed URL never 500s — the list just comes
 // back unfiltered on that dimension.
 const KNOWN_CONTENT_TYPES = new Set(['video', 'x']);
@@ -1187,6 +1205,7 @@ function applyFilters(
   rawDomain: string | undefined,
   rawYear: string | undefined,
   rawContentType: string | undefined,
+  rawTag: string | undefined,
 ): { clauses: string[]; params: unknown[] } {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -1213,6 +1232,12 @@ function applyFilters(
   if (contentType && KNOWN_CONTENT_TYPES.has(contentType)) {
     clauses.push('b.content_type = ?');
     params.push(contentType);
+  }
+
+  const tag = rawTag?.trim();
+  if (tag) {
+    clauses.push(`EXISTS (SELECT 1 FROM json_each(${SAFE_TAGS_JSON}) WHERE value = ?)`);
+    params.push(tag);
   }
 
   return { clauses, params };
