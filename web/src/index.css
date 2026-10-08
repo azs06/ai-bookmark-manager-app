@@ -63,7 +63,7 @@
 
 * { box-sizing: border-box; }
 
-html { scrollbar-gutter: stable; }
+html { scrollbar-gutter: stable; scroll-padding-top: 72px; }  /* clears the sticky top bar */
 html, body, #root { height: 100%; margin: 0; }
 
 body {
@@ -1689,7 +1689,11 @@ section h2 {
 
 /* Phone: the top bar wraps to brand / nav / search, rows lose the indent. */
 @media (max-width: 720px) {
+  /* Wrapped to three rows the bar is ~130px — scrolls away instead of
+     pinning a sixth of the screen. */
+  html { scroll-padding-top: 0; }
   .top-bar {
+    position: static;
     flex-wrap: wrap;
     padding: 10px 16px 8px;
     gap: 8px 16px;
@@ -1722,6 +1726,11 @@ section h2 {
     pointer-events: auto;
   }
   .filter-bar { gap: 8px 16px; }
+
+  /* Answer sources: domain drops under the title instead of squeezing it. */
+  .chat-source { flex-wrap: wrap; }
+  .chat-source-title { flex: 1 1 0; min-width: 0; }
+  .chat-source-domain { flex-basis: 100%; padding-left: 44px; }
 }
 
 /* Reader page — dedicated full-page reading view opened in a new tab from
@@ -1942,7 +1951,7 @@ section h2 {
   border: 1px solid var(--border);
   border-radius: var(--r-xs);
   padding: 0.1em 0.4em;
-  white-space: pre-wrap;
+  white-space: break-spaces;  /* pre-wrap lets runs of spaces hang past the edge */
   overflow-wrap: anywhere;
 }
 .reader-prose pre {
@@ -2008,7 +2017,16 @@ section h2 {
 /* Narrow viewports — drop the side padding on the card so it fills the page,
    slightly tighter line height, smaller body. */
 @media (max-width: 720px) {
-  .reader-header { padding: 10px 16px; gap: 12px; }
+  .reader-header { flex-wrap: wrap; padding: 10px 16px; gap: 8px 12px; }
+  .reader-title-block { flex: 1 1 100%; }
+  .reader-title {
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  .reader-sub { gap: 2px 8px; }
+  .reader-actions { margin-left: auto; }
   .reader-toggle-btn { padding: 6px 10px; }
   .reader-main { margin: 16px auto 60px; padding: 0 12px; }
   .reader-article { padding: 28px 22px; border-radius: var(--r-md); }
