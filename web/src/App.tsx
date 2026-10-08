@@ -1314,15 +1314,18 @@ function buildPageList(current: number, total: number): (number | '…')[] {
 // than a plain scroll). Add future tools (import cleanup, backup export,
 // cost dashboard…) as sibling <section>s below the existing ones.
 function SettingsView({ onArchived }: { onArchived: () => Promise<void> | void }) {
+  // A retry pass can record new 404/410s; remounting the dead-links view
+  // reloads its list so they show up without a manual scan.
+  const [deadListVersion, setDeadListVersion] = useState(0);
   return (
     <div className="settings-view">
       <section className="settings-section">
         <h2 className="settings-section-title">Enrichment</h2>
-        <EnrichmentPanel onProgress={onArchived} />
+        <EnrichmentPanel onProgress={onArchived} onPassComplete={() => setDeadListVersion((v) => v + 1)} />
       </section>
       <section className="settings-section">
         <h2 className="settings-section-title">URL health</h2>
-        <DeadLinksView onArchived={onArchived} />
+        <DeadLinksView key={deadListVersion} onArchived={onArchived} />
       </section>
     </div>
   );
@@ -1730,50 +1733,86 @@ function DeadLinksView({ onArchived }: { onArchived: () => Promise<void> | void 
 // time they open the app.
 type EnrichRun = 'backlog' | 'partial';
 
-function EnrichmentPanel({ onProgress }: { onProgress: () => Promise<void> | void }) {
-  const [pending, setPending] = useState<number | null>(null);
-  const [partial, setPartial] = useState<number | null>(null);
+interface EnrichCounts {
+  pending: number;
+  partial: number;
+  retryable: number;
+  partialByKind: Record<string, number>;
+}
+
+// Why bookmarks are still without a summary, in the order worth reading.
+// Keys match metadata.enrich_error.kind (worker/src/lib/enrichFailure.ts).
+const PARTIAL_KINDS: Array<[string, string]> = [
+  ['unrecorded', 'not retried since failure tracking was added — will retry'],
+  ['temporary', 'temporary error (rate limit, timeout, AI outage) — will retry'],
+  ['gone', 'page removed (404/410) — listed under URL health below'],
+  ['unreachable', 'site is down or misconfigured'],
+  ['blocked', 'site blocks bots or needs a login'],
+  ['unsupported', 'not a web page (PDF, script, …)'],
+  ['no-summary', 'page loaded but had nothing to summarize'],
+];
+
+function EnrichmentPanel({
+  onProgress, onPassComplete,
+}: {
+  onProgress: () => Promise<void> | void;
+  onPassComplete: () => void;
+}) {
+  const [counts, setCounts] = useState<EnrichCounts | null>(null);
   const [running, setRunning] = useState<EnrichRun | null>(null);
   const [sweepLeft, setSweepLeft] = useState<number | null>(null);
+  const [lastPass, setLastPass] = useState<{ tried: number; recovered: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const stopRef = useRef(false);
 
-  const fetchCounts = useCallback(async () => {
+  const fetchCounts = useCallback(async (): Promise<EnrichCounts | null> => {
     try {
       const r = await fetch('/api/bookmarks/pending-count');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const d = (await r.json()) as { pending: number; partial?: number };
-      setPending(d.pending);
-      setPartial(d.partial ?? null);
+      const d = (await r.json()) as Partial<EnrichCounts> & { pending: number };
+      const next: EnrichCounts = {
+        pending: d.pending,
+        partial: d.partial ?? 0,
+        retryable: d.retryable ?? 0,
+        partialByKind: d.partialByKind ?? {},
+      };
+      setCounts(next);
       setError(null);
+      return next;
     } catch (e) {
-      setPending(null);
-      setPartial(null);
+      setCounts(null);
       setError((e as Error).message);
+      return null;
     }
   }, []);
 
   useEffect(() => { void fetchCounts(); }, [fetchCounts]);
 
   // Loop: each round queues a batch, waits for the server to (roughly) finish
-  // it, then refreshes counts. The backlog run stops when nothing is left;
-  // the partial run sweeps each bookmark once (the server tracks `since`),
-  // because a retry that fails again leaves the bookmark partial.
+  // it, then refreshes counts. The backlog run stops when nothing is left.
+  // The partial run is one pass over the retryable bookmarks: the server
+  // starts it, returns `since`, and tries each bookmark at most once.
   const run = async (kind: EnrichRun) => {
     if (running) return;
     stopRef.current = false;
     setRunning(kind);
     setSweepLeft(null);
+    setLastPass(null);
     setError(null);
-    const params = kind === 'partial'
-      ? new URLSearchParams({ scope: 'partial', since: String(Date.now()), limit: '8' })
-      : new URLSearchParams();
+    const partialBefore = counts?.partial ?? 0;
+    let tried = 0;
+    let since: number | null = null;
     try {
       while (!stopRef.current) {
+        const params = kind === 'partial'
+          ? new URLSearchParams({ scope: 'partial', limit: '8', ...(since ? { since: String(since) } : {}) })
+          : new URLSearchParams();
         const r = await fetch(`/api/bookmarks/enrich-imported?${params}`, { method: 'POST' });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const d = (await r.json()) as { queued: number; remaining: number };
+        const d = (await r.json()) as { queued: number; remaining: number; since?: number };
+        if (d.since) since = d.since;
         if (d.queued === 0) break;
+        tried += d.queued;
         setSweepLeft(d.remaining);
         await new Promise((res) => setTimeout(res, 8000));
         await Promise.all([fetchCounts(), Promise.resolve(onProgress())]);
@@ -1782,14 +1821,21 @@ function EnrichmentPanel({ onProgress }: { onProgress: () => Promise<void> | voi
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      // Give the last batch a moment to land before reading the result.
+      if (kind === 'partial' && tried > 0) await new Promise((res) => setTimeout(res, 4000));
+      const after = await fetchCounts();
+      if (kind === 'partial') {
+        setLastPass({ tried, recovered: Math.max(0, partialBefore - (after?.partial ?? partialBefore)) });
+        onPassComplete();
+      }
       setRunning(null);
       setSweepLeft(null);
-      await fetchCounts();
     }
   };
 
   const stop = () => { stopRef.current = true; };
 
+  const pending = counts?.pending ?? null;
   const backlogLine = (() => {
     if (pending === null && error) return 'Status unavailable';
     if (pending === null) return 'Loading status…';
@@ -1798,17 +1844,17 @@ function EnrichmentPanel({ onProgress }: { onProgress: () => Promise<void> | voi
     return `${pending.toLocaleString()} bookmark${pending === 1 ? '' : 's'} waiting to be enriched`;
   })();
 
+  const partial = counts?.partial ?? 0;
+  const retryable = counts?.retryable ?? 0;
   const partialLine = (() => {
-    if (partial === null) return null;
+    if (!counts) return null;
     if (running === 'partial') {
       return sweepLeft === null ? 'Starting…' : `Retrying… ${sweepLeft.toLocaleString()} left in this pass`;
     }
     if (partial === 0) return 'Every enriched bookmark has a summary.';
-    return `${partial.toLocaleString()} bookmark${partial === 1 ? '' : 's'} without a summary`;
+    return `${partial.toLocaleString()} without a summary · ${retryable.toLocaleString()} worth retrying`;
   })();
-
-  const hasBacklog = pending !== null && pending > 0;
-  const hasPartial = partial !== null && partial > 0;
+  const kindRows = PARTIAL_KINDS.filter(([k]) => (counts?.partialByKind[k] ?? 0) > 0);
 
   return (
     <div className="enrichment-panel">
@@ -1826,9 +1872,9 @@ function EnrichmentPanel({ onProgress }: { onProgress: () => Promise<void> | voi
             <button
               className="enrich-banner-btn"
               onClick={() => void run('backlog')}
-              disabled={!hasBacklog || running !== null}
+              disabled={!pending || running !== null}
             >
-              {hasBacklog ? 'Enrich all' : 'Nothing to enrich'}
+              {pending ? 'Enrich all' : 'Nothing to enrich'}
             </button>
           )}
           <button
@@ -1845,11 +1891,9 @@ function EnrichmentPanel({ onProgress }: { onProgress: () => Promise<void> | voi
       {partialLine && (
         <div className="enrichment-panel-intro">
           <p>
-            Bookmarks marked <code>partial</code> were enriched before but came back
-            without a summary — usually a page that failed to load, or a paywall or
-            error page. Retrying fetches each page again and summarizes it (about
-            $0.0003 per bookmark). Each is tried once per pass, so pages that are
-            still unreadable stay partial.
+            Some bookmarks were enriched but came back without a summary. Each one
+            records why, and only failures that might clear up on their own are
+            retried (about $0.0003 per bookmark). One click runs a full pass.
           </p>
           <div className="enrichment-panel-actions">
             {running === 'partial' ? (
@@ -1858,13 +1902,32 @@ function EnrichmentPanel({ onProgress }: { onProgress: () => Promise<void> | voi
               <button
                 className="enrich-banner-btn"
                 onClick={() => void run('partial')}
-                disabled={!hasPartial || running !== null}
+                disabled={retryable === 0 || running !== null}
               >
-                {hasPartial ? 'Retry bookmarks without a summary' : 'Nothing to retry'}
+                {retryable > 0 ? `Retry ${retryable.toLocaleString()}` : 'Nothing worth retrying'}
               </button>
             )}
             <span className="enrichment-panel-status">{partialLine}</span>
           </div>
+          {lastPass && running === null && (
+            <p className="enrichment-pass-result" role="status">
+              Pass finished: tried {lastPass.tried.toLocaleString()}, recovered{' '}
+              {lastPass.recovered.toLocaleString()}.
+              {retryable > 0
+                ? ` ${retryable.toLocaleString()} hit a temporary error and can be retried later.`
+                : ' The rest need no further retries — see why below.'}
+            </p>
+          )}
+          {kindRows.length > 0 && (
+            <ul className="enrichment-kinds">
+              {kindRows.map(([k, label]) => (
+                <li key={k}>
+                  <span className="enrichment-kind-count">{(counts?.partialByKind[k] ?? 0).toLocaleString()}</span>
+                  {label}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
       {error && <div className="dead-links-error">Error: {error}</div>}
