@@ -11,7 +11,9 @@ import { createBookmarkMcpServer } from '../lib/mcp';
 // until its secrets are set. MCP clients can't carry a Cloudflare Access
 // cookie, so production needs an Access Bypass (or Service Auth) app on /mcp.
 export async function mcpRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
-  if (!(await isAuthorized(c.env.MCP_AUTH_TOKEN, c.req.header('authorization')))) {
+  // CORS preflights never carry the Authorization header, so let them reach
+  // the handler's own CORS/Origin checks. They can't invoke tools.
+  if (c.req.method !== 'OPTIONS' && !(await isAuthorized(c.env.MCP_AUTH_TOKEN, c.req.header('authorization')))) {
     return c.json({ error: 'unauthorized' }, 401, {
       'WWW-Authenticate': 'Bearer realm="mcp"',
     });

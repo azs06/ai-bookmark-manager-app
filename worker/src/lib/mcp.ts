@@ -223,8 +223,9 @@ export function createBookmarkMcpServer(
     {
       title: 'Save bookmark',
       description:
-        'Save a URL to the bookmark library. Saving a URL that already exists returns the existing bookmark. '
-        + 'Title, summary, and tags are generated in the background; call get_bookmark later to see them.',
+        'Save a URL to the bookmark library. If the URL is already saved, nothing changes and the existing bookmark '
+        + 'is returned. If it was archived, it is restored, and any title or note you pass replaces the stored one. '
+        + 'For new URLs, title, summary, and tags are generated in the background; call get_bookmark later to see them.',
       inputSchema: z.object({
         url: z.string().trim().url().max(2048).describe('http(s) URL to save'),
         title: z.string().trim().min(1).max(500).optional(),
