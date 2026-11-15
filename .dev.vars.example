@@ -1,3 +1,5 @@
 ANTHROPIC_API_KEY=your-anthropic-key
 ALLOWED_ORIGINS=http://localhost:5173
 ALLOWED_EXTENSION_ORIGINS=chrome-extension://YOUR_EXTENSION_ID
+# Optional: enables the /mcp endpoint. Generate with `openssl rand -hex 32`.
+MCP_AUTH_TOKEN=

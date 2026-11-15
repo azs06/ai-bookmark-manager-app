@@ -13,7 +13,7 @@
     // skip the Worker entirely and go to the asset binding — so omitting
     // /api/* would route every API call to the SPA fallback, which returns
     // index.html and the SPA's fetch() chokes on "<!doctype" not being JSON.
-    "run_worker_first": ["/s/*", "/api/*"]
+    "run_worker_first": ["/s/*", "/api/*", "/mcp"]
   },
 
   "d1_databases": [
@@ -81,7 +81,7 @@
         "directory": "./web/dist",
         "binding": "ASSETS",
         "not_found_handling": "single-page-application",
-        "run_worker_first": ["/s/*", "/api/*"]
+        "run_worker_first": ["/s/*", "/api/*", "/mcp"]
       },
 
       "vars": {

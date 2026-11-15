@@ -8,6 +8,7 @@ import suggestions from './routes/suggestions';
 import chat from './routes/chat';
 import shortlinks, { shortlinkRedirect } from './routes/shortlinks';
 import telegram from './routes/telegram';
+import { mcpRoute } from './routes/mcp';
 import { runDailySuggestions } from './lib/suggestions';
 import { pollAllFeeds } from './lib/feeds';
 import { resolveAllowedOrigin } from './lib/cors';
@@ -41,6 +42,10 @@ app.route('/api/shortlinks', shortlinks);
 // Access "Bypass" app on /api/telegram/webhook in production. Auth is
 // layered inside the route (secret header + chat_id allowlist).
 app.route('/api/telegram', telegram);
+
+// Remote MCP server (Streamable HTTP). Bearer-token auth inside the route;
+// needs a CF Access Bypass or Service Auth app on /mcp in production.
+app.all('/mcp', mcpRoute);
 
 // Public short-link redirect. Lives at the root (not under /api) so the URL
 // stays short. Requires a CF Access bypass policy on /s/* in production —

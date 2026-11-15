@@ -5,6 +5,7 @@ export interface Env extends Cloudflare.Env {
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   TELEGRAM_ALLOWED_CHAT_ID?: string;
+  MCP_AUTH_TOKEN?: string;
 }
 
 export type BookmarkStatus =
