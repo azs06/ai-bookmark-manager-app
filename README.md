@@ -236,13 +236,20 @@ Tools:
 
 There are no update or delete tools.
 
-### Secret
+### Tokens
 
-```dotenv
-MCP_AUTH_TOKEN=
+Clients authenticate with `Authorization: Bearer <token>`. Create tokens in **Settings → MCP access**: name the token, copy it (it is shown once), and paste it into your client. The same panel shows when each token was last used and revokes tokens immediately.
+
+Tokens are stored in D1 as SHA-256 hashes, so apply the migration first:
+
+```bash
+npx wrangler d1 migrations apply bookmarks --local
+npx wrangler -c wrangler.local.jsonc d1 migrations apply bookmarks --remote
 ```
 
-Generate one with `openssl rand -hex 32`. Clients send it as `Authorization: Bearer <token>`. With no token configured, `/mcp` rejects every request with `401`. For local: append to `.dev.vars`. For production: `wrangler secret put MCP_AUTH_TOKEN --env production`.
+The token API lives at `/api/mcp-tokens`, behind Cloudflare Access like the rest of `/api/*`. Never add an Access bypass for it.
+
+Optionally, a `MCP_AUTH_TOKEN` Worker secret is also accepted as a token (`wrangler secret put MCP_AUTH_TOKEN --env production`). With no tokens and no secret, `/mcp` rejects every request with `401`.
 
 ### Cloudflare Access
 
@@ -257,7 +264,7 @@ Claude Code:
 
 ```bash
 claude mcp add --transport http bookmarks https://<your-host>/mcp \
-  --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
+  --header "Authorization: Bearer <token>"
 ```
 
 Clients that accept a URL plus headers (Cursor and others):
@@ -267,7 +274,7 @@ Clients that accept a URL plus headers (Cursor and others):
   "mcpServers": {
     "bookmarks": {
       "url": "https://<your-host>/mcp",
-      "headers": { "Authorization": "Bearer <MCP_AUTH_TOKEN>" }
+      "headers": { "Authorization": "Bearer <token>" }
     }
   }
 }
@@ -280,7 +287,7 @@ Clients that only launch local (stdio) servers, such as Claude Desktop's config 
   "mcpServers": {
     "bookmarks": {
       "command": "npx",
-      "args": ["mcp-remote", "https://<your-host>/mcp", "--header", "Authorization: Bearer <MCP_AUTH_TOKEN>"]
+      "args": ["mcp-remote", "https://<your-host>/mcp", "--header", "Authorization: Bearer <token>"]
     }
   }
 }
@@ -288,11 +295,11 @@ Clients that only launch local (stdio) servers, such as Claude Desktop's config 
 
 ### Testing locally
 
-With `npm run dev` running and `MCP_AUTH_TOKEN` in `.dev.vars`, point the [MCP Inspector](https://github.com/modelcontextprotocol/inspector) at `http://localhost:8787/mcp` with the bearer header, or use curl:
+With `npm run dev` running and a token from Settings (or `MCP_AUTH_TOKEN` in `.dev.vars`), point the [MCP Inspector](https://github.com/modelcontextprotocol/inspector) at `http://localhost:8787/mcp` with the bearer header, or use curl:
 
 ```bash
 curl -X POST http://localhost:8787/mcp \
-  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'

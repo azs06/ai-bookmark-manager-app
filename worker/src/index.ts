@@ -9,6 +9,7 @@ import chat from './routes/chat';
 import shortlinks, { shortlinkRedirect } from './routes/shortlinks';
 import telegram from './routes/telegram';
 import { mcpRoute } from './routes/mcp';
+import mcpTokens from './routes/mcpTokens';
 import { runDailySuggestions } from './lib/suggestions';
 import { pollAllFeeds } from './lib/feeds';
 import { resolveAllowedOrigin } from './lib/cors';
@@ -38,6 +39,7 @@ app.route('/api/search', search);
 app.route('/api/suggestions', suggestions);
 app.route('/api/chat', chat);
 app.route('/api/shortlinks', shortlinks);
+app.route('/api/mcp-tokens', mcpTokens);
 // Telegram bot webhook. Public from Telegram's perspective — needs a CF
 // Access "Bypass" app on /api/telegram/webhook in production. Auth is
 // layered inside the route (secret header + chat_id allowlist).
