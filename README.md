@@ -224,7 +224,7 @@ D1 writes hit the local SQLite (`npm run db:init:local` first if you haven't). E
 
 ## MCP server (optional)
 
-The Worker exposes a remote [Model Context Protocol](https://modelcontextprotocol.io) server at `/mcp` (Streamable HTTP), so MCP clients like Claude Code, Claude Desktop, and Cursor can work with your library. It is stateless and built on `createMcpHandler` from the Cloudflare Agents SDK.
+The Worker exposes a remote [Model Context Protocol](https://modelcontextprotocol.io) server at `/mcp` (Streamable HTTP), so MCP clients like Claude Code, Claude Desktop, and Cursor can work with your library. It is stateless and built on `createMcpHandler` from the official MCP TypeScript SDK (`@modelcontextprotocol/server`).
 
 Tools:
 

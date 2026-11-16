@@ -25,13 +25,15 @@ export async function mcpRoute(c: Context<{ Bindings: Env }>): Promise<Response>
   // The SDK handler is deliberately validation-free, so do the Host/Origin
   // checks it asks for. Host: DNS-rebinding protection for localhost only;
   // deployed hostnames are pinned by Cloudflare routing. Origin: browsers may
-  // only call from localhost (e.g. MCP Inspector) or this Worker's own host.
-  // Non-browser clients send no Origin and pass.
+  // only call from localhost-class origins (e.g. MCP Inspector). The Worker's
+  // own hostname is deliberately not allowed: it derives from the Host header,
+  // which a rebinding page controls in local dev, and the SPA never calls
+  // /mcp. Non-browser clients send no Origin and pass.
   const hostname = new URL(request.url).hostname;
   const localhosts = localhostAllowedHostnames();
   const rejected =
     (localhosts.includes(hostname) ? hostHeaderValidationResponse(request, localhosts) : undefined)
-    ?? originValidationResponse(request, [...localhostAllowedOrigins(), hostname]);
+    ?? originValidationResponse(request, localhostAllowedOrigins());
   if (rejected) return rejected;
 
   if (!(await isAuthorized(c.env.MCP_AUTH_TOKEN, c.req.header('authorization')))) {
