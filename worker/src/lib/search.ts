@@ -1,0 +1,146 @@
+import type { Env } from '../types';
+import { embedQuery } from './vector';
+
+const TOP_K = 20;
+const KEYWORD_LIMIT = 30;
+const RRF_K = 60;
+// Minimum cosine score for a semantic match. BGE roughly: 0.7+ strong, 0.5-0.7 loose,
+// <0.5 noise. Keyword matches are never filtered by score — substring hit is definitive.
+export const DEFAULT_MIN_SEMANTIC_SCORE = 0.5;
+
+export interface SearchHit {
+  id: number;
+  url: string;
+  title: string | null;
+  note: string;
+  og_image_url: string | null;
+  domain: string | null;
+  ai_summary: string | null;
+  ai_tags: string;
+  category_id: number | null;
+  importance: number;
+  status: string;
+  content_type: string | null;
+  metadata: string;
+  short_code: string | null;
+  click_count: number;
+  created_at: number;
+  last_viewed_at: number | null;
+  score: number;
+  semantic_score: number | undefined;
+  matched_by: string[];
+}
+
+// Hybrid keyword + semantic search, fused with Reciprocal Rank Fusion. Shared
+// by GET /api/search and the MCP search_bookmarks tool. Results are sorted
+// best-first; callers slice if they want fewer.
+export async function hybridSearch(
+  env: Env,
+  q: string,
+  minScore: number = DEFAULT_MIN_SEMANTIC_SCORE,
+): Promise<SearchHit[]> {
+  // Fire keyword and semantic in parallel. Semantic is allowed to fail — in
+  // local dev Vectorize often throws (empty index / no emulation), and we'd
+  // rather degrade to keyword-only than return a 500 that masks real matches.
+  const [keywordIds, semanticMatches] = await Promise.all([
+    keywordSearch(env, q),
+    semanticSearch(env, q, minScore).catch((err) => {
+      // "needs to be run remotely" is wrangler's expected local-dev message
+      // when Vectorize isn't emulated — suppress the noise so real failures
+      // stand out. Everything else still logs.
+      if (!isLocalVectorizeUnavailable(err)) {
+        console.error('semantic search failed', err);
+      }
+      return [] as VecMatch[];
+    }),
+  ]);
+
+  // Reciprocal Rank Fusion: each ranked list contributes 1/(k + rank) per doc.
+  // Docs appearing in both lists get summed signal and rise to the top.
+  const rrfScores = new Map<number, number>();
+  const semanticScore = new Map<number, number>();
+
+  keywordIds.forEach((id, rank) => {
+    rrfScores.set(id, (rrfScores.get(id) ?? 0) + 1 / (RRF_K + rank + 1));
+  });
+
+  semanticMatches.forEach((m, rank) => {
+    const id = Number(m.id);
+    if (!Number.isFinite(id)) return;
+    rrfScores.set(id, (rrfScores.get(id) ?? 0) + 1 / (RRF_K + rank + 1));
+    semanticScore.set(id, m.score);
+  });
+
+  if (!rrfScores.size) return [];
+
+  const ids = [...rrfScores.keys()];
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = await env.DB
+    .prepare(`
+      SELECT id, url, title, note, og_image_url, domain, ai_summary, ai_tags,
+             category_id, importance, status, content_type, metadata,
+             short_code, click_count, created_at, last_viewed_at
+      FROM bookmarks
+      WHERE id IN (${placeholders}) AND status != 'archived'
+    `)
+    .bind(...ids)
+    .all<Omit<SearchHit, 'score' | 'semantic_score' | 'matched_by'>>();
+
+  return (rows.results ?? [])
+    .map((row) => {
+      const base = rrfScores.get(row.id) ?? 0;
+      const importanceBoost = 1 + row.importance * 0.05;
+      return {
+        ...row,
+        score: base * importanceBoost,
+        semantic_score: semanticScore.get(row.id),
+        matched_by: matchSources(row.id, keywordIds, semanticScore),
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
+async function keywordSearch(env: Env, q: string): Promise<number[]> {
+  const pattern = `%${q.toLowerCase()}%`;
+  const rows = await env.DB
+    .prepare(`
+      SELECT id FROM bookmarks
+      WHERE status != 'archived'
+        AND (LOWER(title)     LIKE ?
+          OR LOWER(ai_summary) LIKE ?
+          OR LOWER(ai_tags)    LIKE ?
+          OR LOWER(domain)     LIKE ?
+          OR LOWER(note)       LIKE ?)
+      ORDER BY importance DESC, created_at DESC
+      LIMIT ?
+    `)
+    .bind(pattern, pattern, pattern, pattern, pattern, KEYWORD_LIMIT)
+    .all<{ id: number }>();
+  return (rows.results ?? []).map((r) => r.id);
+}
+
+interface VecMatch { id: string; score: number; }
+
+async function semanticSearch(env: Env, q: string, minScore: number): Promise<VecMatch[]> {
+  if (!env.VECTORIZE || !env.AI) return [];
+  const vector = await embedQuery(env, q);
+  if (!vector) return [];
+  const resp = await env.VECTORIZE.query(vector, { topK: TOP_K });
+  return resp.matches.filter((m) => m.score >= minScore);
+}
+
+function isLocalVectorizeUnavailable(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('needs to be run remotely');
+}
+
+function matchSources(
+  id: number,
+  keywordIds: number[],
+  semanticScore: Map<number, number>,
+): string[] {
+  const sources: string[] = [];
+  if (keywordIds.includes(id)) sources.push('keyword');
+  if (semanticScore.has(id)) sources.push('semantic');
+  return sources;
+}

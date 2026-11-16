@@ -3,7 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "workspaces": ["web"],
+  "workspaces": [
+    "web"
+  ],
   "scripts": {
     "build": "npm run build:web",
     "cf-typegen": "wrangler types",
@@ -20,8 +22,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
     "fast-xml-parser": "^4.5.0",
-    "hono": "^4.6.14"
+    "hono": "^4.6.14",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

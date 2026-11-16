@@ -16,6 +16,7 @@ The browser extension lives in a separate companion repo and talks to this app o
 - Hybrid keyword + semantic search
 - Daily bookmark suggestions
 - Chat over your bookmark library
+- MCP server so AI assistants can search and save bookmarks
 
 ## Stack
 
@@ -220,3 +221,81 @@ curl -i -X POST http://localhost:8787/api/telegram/webhook \
 Useful payload variants: drop the secret header → expect `401`; change `chat.id` to a different number → silent `200` with a rejected-chat log line; replace `text` with `caption` → covers forwarded media with a URL in the caption; re-send the same URL → expect `✓ Already saved: <title>`.
 
 D1 writes hit the local SQLite (`npm run db:init:local` first if you haven't). Enrichment makes real network calls so the summary you see in the reply is the real one.
+
+## MCP server (optional)
+
+The Worker exposes a remote [Model Context Protocol](https://modelcontextprotocol.io) server at `/mcp` (Streamable HTTP), so MCP clients like Claude Code, Claude Desktop, and Cursor can work with your library. It is stateless and built on `createMcpHandler` from the official MCP TypeScript SDK (`@modelcontextprotocol/server`).
+
+Tools:
+
+- `search_bookmarks` — hybrid keyword + semantic search (same ranking as `/api/search`)
+- `list_bookmarks` — newest first, filterable by category (including subcategories), tag, domain, or content type
+- `get_bookmark` — full details for one bookmark, including up to 4,000 characters of content excerpt
+- `list_categories` — the category tree with full paths and counts
+- `save_bookmark` — save a URL through the same ingest path as the extension; enrichment runs in the background
+
+There are no update or delete tools.
+
+### Secret
+
+```dotenv
+MCP_AUTH_TOKEN=
+```
+
+Generate one with `openssl rand -hex 32`. Clients send it as `Authorization: Bearer <token>`. With no token configured, `/mcp` rejects every request with `401`. For local: append to `.dev.vars`. For production: `wrangler secret put MCP_AUTH_TOKEN --env production`.
+
+### Cloudflare Access
+
+MCP clients can't carry an Access login cookie. Pick one:
+
+- **Bypass:** add an Access app scoped to `/mcp` with **Action = Bypass**. The bearer token is then the only gate.
+- **Service Auth:** add an Access app scoped to `/mcp` with a **Service Auth** policy and a service token. Clients then send `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers in addition to the bearer token.
+
+### Connecting a client
+
+Claude Code:
+
+```bash
+claude mcp add --transport http bookmarks https://<your-host>/mcp \
+  --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
+```
+
+Clients that accept a URL plus headers (Cursor and others):
+
+```json
+{
+  "mcpServers": {
+    "bookmarks": {
+      "url": "https://<your-host>/mcp",
+      "headers": { "Authorization": "Bearer <MCP_AUTH_TOKEN>" }
+    }
+  }
+}
+```
+
+Clients that only launch local (stdio) servers, such as Claude Desktop's config file, can bridge with `mcp-remote`:
+
+```json
+{
+  "mcpServers": {
+    "bookmarks": {
+      "command": "npx",
+      "args": ["mcp-remote", "https://<your-host>/mcp", "--header", "Authorization: Bearer <MCP_AUTH_TOKEN>"]
+    }
+  }
+}
+```
+
+### Testing locally
+
+With `npm run dev` running and `MCP_AUTH_TOKEN` in `.dev.vars`, point the [MCP Inspector](https://github.com/modelcontextprotocol/inspector) at `http://localhost:8787/mcp` with the bearer header, or use curl:
+
+```bash
+curl -X POST http://localhost:8787/mcp \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+Local dev uses remote Vectorize and Workers AI bindings. A `save_bookmark` call for a new URL locally will upsert an embedding into the remote index under a local D1 id, so prefer testing saves against a deployed Worker.
