@@ -45,6 +45,15 @@ app.route('/api/telegram', telegram);
 
 // Remote MCP server (Streamable HTTP). Bearer-token auth inside the route;
 // needs a CF Access Bypass or Service Auth app on /mcp in production.
+// Wildcard CORS is safe: auth is a bearer header, never cookies, and the
+// route rejects browser Origins other than localhost and this host.
+app.use('/mcp', cors({
+  origin: '*',
+  allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Accept', 'Authorization', 'Mcp-Session-Id', 'MCP-Protocol-Version', 'Mcp-Method', 'Mcp-Name'],
+  exposeHeaders: ['Mcp-Session-Id'],
+  maxAge: 86400,
+}));
 app.all('/mcp', mcpRoute);
 
 // Public short-link redirect. Lives at the root (not under /api) so the URL

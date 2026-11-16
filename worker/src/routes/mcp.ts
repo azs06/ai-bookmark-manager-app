@@ -1,5 +1,11 @@
 import type { Context } from 'hono';
-import { createMcpHandler } from 'agents/mcp/server';
+import {
+  createMcpHandler,
+  hostHeaderValidationResponse,
+  localhostAllowedHostnames,
+  localhostAllowedOrigins,
+  originValidationResponse,
+} from '@modelcontextprotocol/server';
 import type { Env } from '../types';
 import { createBookmarkMcpServer } from '../lib/mcp';
 
@@ -10,18 +16,36 @@ import { createBookmarkMcpServer } from '../lib/mcp';
 // endpoint rejects everything, matching how the Telegram webhook stays inert
 // until its secrets are set. MCP clients can't carry a Cloudflare Access
 // cookie, so production needs an Access Bypass (or Service Auth) app on /mcp.
+//
+// CORS preflights are answered by the cors() middleware in index.ts before
+// this runs; they never carry the Authorization header.
 export async function mcpRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
-  // CORS preflights never carry the Authorization header, so let them reach
-  // the handler's own CORS/Origin checks. They can't invoke tools.
-  if (c.req.method !== 'OPTIONS' && !(await isAuthorized(c.env.MCP_AUTH_TOKEN, c.req.header('authorization')))) {
+  const request = c.req.raw;
+
+  // The SDK handler is deliberately validation-free, so do the Host/Origin
+  // checks it asks for. Host: DNS-rebinding protection for localhost only;
+  // deployed hostnames are pinned by Cloudflare routing. Origin: browsers may
+  // only call from localhost (e.g. MCP Inspector) or this Worker's own host.
+  // Non-browser clients send no Origin and pass.
+  const hostname = new URL(request.url).hostname;
+  const localhosts = localhostAllowedHostnames();
+  const rejected =
+    (localhosts.includes(hostname) ? hostHeaderValidationResponse(request, localhosts) : undefined)
+    ?? originValidationResponse(request, [...localhostAllowedOrigins(), hostname]);
+  if (rejected) return rejected;
+
+  if (!(await isAuthorized(c.env.MCP_AUTH_TOKEN, c.req.header('authorization')))) {
     return c.json({ error: 'unauthorized' }, 401, {
       'WWW-Authenticate': 'Bearer realm="mcp"',
     });
   }
 
-  const ctx = c.executionCtx;
-  const handler = createMcpHandler(() => createBookmarkMcpServer(c.env, ctx));
-  return handler(c.req.raw, c.env, ctx as ExecutionContext);
+  // createMcpHandler is stateless and builds a server per request, so env and
+  // ctx can be closed over directly.
+  const handler = createMcpHandler(() => createBookmarkMcpServer(c.env, c.executionCtx), {
+    onerror: (err) => console.error('mcp error', err),
+  });
+  return handler.fetch(request);
 }
 
 async function isAuthorized(expected: string | undefined, header: string | undefined): Promise<boolean> {
