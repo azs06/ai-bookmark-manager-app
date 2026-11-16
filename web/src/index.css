@@ -1422,6 +1422,63 @@ section h2 {
   color: var(--text);
 }
 
+/* ─── MCP access (settings) ─────────────────────────────────────── */
+
+.mcp-endpoint,
+.mcp-copy-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.mcp-endpoint-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted-strong);
+}
+.mcp-code {
+  font-size: 12px;
+  padding: 4px 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: var(--text);
+}
+.mcp-code-wrap {
+  flex: 1 1 320px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.mcp-name-input { flex: 1 1 260px; }
+.mcp-created {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--accent);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  font-size: 13px;
+}
+.mcp-created p { margin: 0; }
+.mcp-created-title { color: var(--text); }
+.mcp-created-hint { color: var(--muted); font-size: 12px; }
+.mcp-token-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+}
+.mcp-token-row:first-of-type { border-top: none; }
+.mcp-token-meta {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.mcp-token-meta code { font-size: 11px; }
+
 /* ─── Dead Links view ────────────────────────────────────────────── */
 
 .dead-links-view {

@@ -1327,6 +1327,198 @@ function SettingsView({ onArchived }: { onArchived: () => Promise<void> | void }
         <h2 className="settings-section-title">URL health</h2>
         <DeadLinksView key={deadListVersion} onArchived={onArchived} />
       </section>
+      <section className="settings-section">
+        <h2 className="settings-section-title">MCP access</h2>
+        <McpAccessPanel />
+      </section>
+    </div>
+  );
+}
+
+interface McpToken {
+  id: number;
+  name: string;
+  token_prefix: string;
+  created_at: number;
+  last_used_at: number | null;
+}
+
+// Tokens for the /mcp endpoint. The server returns a new token's plaintext
+// exactly once (POST response); after "Done" it is gone from the UI too, and
+// only the prefix is ever listed.
+function McpAccessPanel() {
+  const [tokens, setTokens] = useState<McpToken[]>([]);
+  const [envTokenConfigured, setEnvTokenConfigured] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [name, setName] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [created, setCreated] = useState<{ name: string; token: string } | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+  const [revokingId, setRevokingId] = useState<number | null>(null);
+
+  const endpoint = `${window.location.origin}/mcp`;
+
+  const load = useCallback(async () => {
+    try {
+      const r = await fetch('/api/mcp-tokens');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = (await r.json()) as { tokens: McpToken[]; env_token_configured: boolean };
+      setTokens(d.tokens ?? []);
+      setEnvTokenConfigured(d.env_token_configured);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const copy = async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(key);
+      setTimeout(() => setCopied((cur) => (cur === key ? null : cur)), 1500);
+    } catch {
+      setError('Copy failed. Select the text and copy it manually.');
+    }
+  };
+
+  const create = async (e: FormEvent) => {
+    e.preventDefault();
+    const trimmed = name.trim();
+    if (!trimmed || creating) return;
+    setCreating(true);
+    setError(null);
+    try {
+      const r = await fetch('/api/mcp-tokens', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: trimmed }),
+      });
+      const d = (await r.json().catch(() => ({}))) as { token?: string; error?: string };
+      if (!r.ok || !d.token) throw new Error(d.error ?? `HTTP ${r.status}`);
+      setCreated({ name: trimmed, token: d.token });
+      setName('');
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const revoke = async (t: McpToken) => {
+    if (!confirm(`Revoke "${t.name}"? Clients using it will stop working immediately.`)) return;
+    setRevokingId(t.id);
+    try {
+      const r = await fetch(`/api/mcp-tokens/${t.id}`, { method: 'DELETE' });
+      if (!r.ok && r.status !== 404) throw new Error(`HTTP ${r.status}`);
+      setTokens((prev) => prev.filter((x) => x.id !== t.id));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRevokingId(null);
+    }
+  };
+
+  const claudeCommand = created
+    ? `claude mcp add --transport http bookmarks ${endpoint} --header "Authorization: Bearer ${created.token}"`
+    : '';
+
+  return (
+    <div className="dead-links-view">
+      <div className="dead-links-intro">
+        <p>
+          Lets AI assistants such as Claude Code and Cursor search, browse, and save your
+          bookmarks over MCP. Each client needs a token, sent as
+          <code>Authorization: Bearer &lt;token&gt;</code>.
+        </p>
+        <div className="mcp-endpoint">
+          <span className="mcp-endpoint-label">Endpoint</span>
+          <code className="mcp-code">{endpoint}</code>
+          <button className="dead-links-edit-cancel" onClick={() => void copy('endpoint', endpoint)}>
+            {copied === 'endpoint' ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+        <form className="dead-links-actions" onSubmit={create}>
+          <input
+            className="dead-links-edit-input mcp-name-input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Token name, e.g. Claude Code on laptop"
+            maxLength={100}
+            disabled={creating}
+            aria-label="Token name"
+          />
+          <button className="enrich-banner-btn" type="submit" disabled={!name.trim() || creating}>
+            {creating ? 'Generating…' : 'Generate token'}
+          </button>
+        </form>
+      </div>
+
+      {created && (
+        <div className="mcp-created" role="status">
+          <p className="mcp-created-title">
+            Token for <strong>{created.name}</strong>. Copy it now: it won't be shown again.
+          </p>
+          <div className="mcp-copy-row">
+            <code className="mcp-code mcp-code-wrap">{created.token}</code>
+            <button className="dead-links-edit-cancel" onClick={() => void copy('token', created.token)}>
+              {copied === 'token' ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+          <p className="mcp-created-hint">Claude Code:</p>
+          <div className="mcp-copy-row">
+            <code className="mcp-code mcp-code-wrap">{claudeCommand}</code>
+            <button className="dead-links-edit-cancel" onClick={() => void copy('command', claudeCommand)}>
+              {copied === 'command' ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+          <div>
+            <button className="enrich-banner-btn" onClick={() => setCreated(null)}>Done</button>
+          </div>
+        </div>
+      )}
+
+      {error && <div className="dead-links-error">Error: {error}</div>}
+
+      {loading ? (
+        <div className="dead-links-empty">Loading…</div>
+      ) : tokens.length === 0 ? (
+        <div className="dead-links-empty">No tokens yet.</div>
+      ) : (
+        <div className="dead-links-group">
+          {tokens.map((t) => (
+            <div key={t.id} className="mcp-token-row">
+              <div className="dead-links-row-body">
+                <div className="dead-links-row-title">{t.name}</div>
+                <div className="mcp-token-meta">
+                  <code>{t.token_prefix}…</code>
+                  {' · '}created {formatRelativeTime(t.created_at)}
+                  {' · '}{t.last_used_at ? `last used ${formatRelativeTime(t.last_used_at)}` : 'never used'}
+                </div>
+              </div>
+              <button
+                className="dead-links-edit-cancel"
+                onClick={() => void revoke(t)}
+                disabled={revokingId === t.id}
+              >
+                {revokingId === t.id ? 'Revoking…' : 'Revoke'}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {envTokenConfigured && (
+        <p className="mcp-token-meta">
+          The <code>MCP_AUTH_TOKEN</code> Worker secret also grants access. Delete it with
+          <code>wrangler secret delete MCP_AUTH_TOKEN</code> if you only want the tokens above.
+        </p>
+      )}
     </div>
   );
 }
